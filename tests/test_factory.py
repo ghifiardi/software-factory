@@ -556,3 +556,26 @@ def test_shim_merges_system_blocks_and_swaps_in_the_gateway_key(tmp_path):
         assert seen["auth"] == "Bearer real-key" and seen["x_api_key"] is None   # client's placeholder never forwarded
     finally:
         shim.terminate(); shim.wait(); up.shutdown()
+
+
+# ───────── headless agent runs: nothing may wait in the background ─────────
+@pytest.mark.parametrize("workflow", AGENT_WORKFLOWS)
+def test_agent_jobs_disable_background_work(workflow):
+    wf, _ = _wf(ROOT / ".github/workflows" / workflow)
+    for job in wf["jobs"].values():
+        steps = job.get("steps", [])
+        names = [s.get("name") for s in steps]
+        agent_idx = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("anthropics/claude-code-action")]
+        if not agent_idx:
+            continue
+        i = names.index("Non-interactive agent settings")
+        assert i < agent_idx[0]
+        run = steps[i]["run"]
+        assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" in run and "BASH_MAX_TIMEOUT_MS=" in run
+
+
+def test_render_blocks_monitor_and_implement_prompt_explains_headless(tmp_path, monkeypatch):
+    o, txt = _render_outputs(tmp_path, monkeypatch, ROOT / "factory/factory.yaml")
+    assert '--disallowedTools "Monitor"' in txt
+    assert "--max-turns 60" in txt
+    assert "non-interactive run" in txt and "Never start work in the\nbackground" in txt

@@ -69,7 +69,7 @@ budget:
   # Dollar limits count only anthropic-api sessions: subscription and gateway runs aren't billed per call.
   monthly_soft_limit_usd: 30      # warning in metrics report (pilot)
   monthly_hard_limit_usd: 50      # agents stop starting new sessions (pilot — raise once it earns it)
-  per_session_max_turns: 40
+  per_session_max_turns: 60      # implement: rule + fixtures + corpus + docs needs ~40-50
 
 # Paths an agent PR may never touch. Enforced after every run; violating PRs
 # are closed automatically.
@@ -93,6 +93,7 @@ workflows:
 
   implement:
     trigger: { event: issues.labeled, label: "factory:implement" }
+    max_turns: 60
     prompt: prompts/implement.md
     allowed_tools: "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh pr create:*),Bash(npm test:*),Bash(npm run:*),Bash(pytest:*),Bash(python -m pytest:*),Bash(make test:*)"
 

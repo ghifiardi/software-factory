@@ -126,6 +126,16 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false   # triage never pushes
+      # Headless session: when the agent ends its turn the run is over, so it must never
+      # leave work in the background. Long timeouts let full test suites run in the foreground.
+      - name: Non-interactive agent settings
+        run: |
+          {
+            echo "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1"
+            echo "BASH_DEFAULT_TIMEOUT_MS=1200000"
+            echo "BASH_MAX_TIMEOUT_MS=2400000"
+          } >> "$GITHUB_ENV"
+
       # inference.provider = gateway: a local shim fixes the request shape for the gateway
       # and adds GATEWAY_KEY, which only this step and the shim process see.
       - name: Start the gateway shim

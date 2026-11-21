@@ -1,15 +1,25 @@
-# MEASUREMENT — central factory repo, weekly. Deterministic script, no agent.
+# MEASUREMENT — reusable, called weekly from the PRIVATE data repo, so the report
+# issue and archive stay private. Deterministic script, no agent.
 # Throughput, human interactions per PR, cycle time, cost per merged PR, quality, budget.
 name: factory-metrics
 
 on:
-  schedule:
-    - cron: "0 3 * * 1"   # Mondays UTC, after improve
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      factory_repo:
+        description: Public factory repo with the code, prompts and config (owner/name)
+        type: string
+        required: true
+      factory_ref:
+        type: string
+        default: main
       days:
         description: Window in days
+        type: string
         default: "7"
+    secrets:
+      FACTORY_TOKEN:
+        required: true   # reads the product repos' PRs
 
 permissions: {}
 
@@ -22,13 +32,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write   # archive the report on factory-data
+      contents: write   # archive the report on factory-data (data repo)
       issues: write     # publish the report issue
     env:
       REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v6
         with:
+          repository: ${{ inputs.factory_repo }}
+          ref: ${{ inputs.factory_ref }}
           persist-credentials: false
       - uses: actions/checkout@v6
         with:

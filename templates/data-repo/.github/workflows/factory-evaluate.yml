@@ -1,0 +1,21 @@
+# Lives on `main` of the PRIVATE data repo (installed by scripts/bootstrap.sh).
+# Runs the evaluate loop here so its artifacts, logs and summaries stay private.
+# Keep it disabled (Actions tab) until ~20 sessions are recorded.
+name: factory-evaluate
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # daily UTC — keep in sync with factory.yaml → workflows.evaluate.trigger
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  evaluate:
+    permissions:
+      contents: write   # push verdicts to factory-data
+    uses: ghifiardi/software-factory/.github/workflows/factory-evaluate.yml@main
+    with:
+      factory_repo: ghifiardi/software-factory
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

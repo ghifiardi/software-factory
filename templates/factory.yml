@@ -3,6 +3,7 @@
 # factory repo, so every repo gets improvements automatically.
 #
 # Required repo secrets: ANTHROPIC_API_KEY, FACTORY_TOKEN, FACTORY_LOG_KEY (set by scripts/bootstrap.sh)
+# The factory repo must be PUBLIC: a public product repo can't call workflows in a private one.
 name: software-factory
 
 on:
@@ -18,6 +19,7 @@ jobs:
     uses: ghifiardi/software-factory/.github/workflows/factory-triage.yml@main
     with:
       factory_repo: ghifiardi/software-factory
+      data_repo: ghifiardi/software-factory-data
     secrets:   # pass only what the factory needs — not `inherit`, which hands over every repo secret
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       FACTORY_TOKEN: ${{ secrets.FACTORY_TOKEN }}
@@ -33,6 +35,7 @@ jobs:
     uses: ghifiardi/software-factory/.github/workflows/factory-implement.yml@main
     with:
       factory_repo: ghifiardi/software-factory
+      data_repo: ghifiardi/software-factory-data
     secrets:   # pass only what the factory needs — not `inherit`, which hands over every repo secret
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       FACTORY_TOKEN: ${{ secrets.FACTORY_TOKEN }}

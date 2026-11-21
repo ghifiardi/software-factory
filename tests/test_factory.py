@@ -332,3 +332,76 @@ def test_log_encryption_skips_without_public_key(tmp_path):
     subprocess.run(["bash", "-e", "-c", _step("factory-implement.yml", "agent", "Encrypt the execution log for the record job")],
                    check=True, env=env, capture_output=True)
     assert "ready=true" not in out.read_text() and not (rt / "factory-log/execution.json.enc").exists()
+
+
+# ───────── public factory repo + private data repo ─────────
+def _wf(path):
+    d = _yaml.safe_load(Path(path).read_text())
+    return d, d.get("on", d.get(True))   # PyYAML reads the bare key `on` as True
+
+
+def _checkouts(wf):
+    for job in wf["jobs"].values():
+        for st in job.get("steps", []):
+            if str(st.get("uses", "")).startswith("actions/checkout"):
+                yield st.get("with", {})
+
+
+def test_validate_requires_separate_data_repo(tmp_path):
+    cfg = _yaml.safe_load((ROOT / "factory/factory.yaml").read_text())
+    for bad in (None, cfg["factory_repo"]):
+        c = dict(cfg)
+        if bad is None:
+            c.pop("data_repo")
+        else:
+            c["data_repo"] = bad
+        p = tmp_path / "f.yaml"; p.write_text(_yaml.safe_dump(c))
+        assert factory.main(["--config", str(p), "validate"]) == 1
+
+
+@pytest.mark.parametrize("workflow", ["factory-implement.yml", "factory-triage.yml"])
+def test_product_stages_keep_data_in_the_data_repo(workflow):
+    wf, on = _wf(ROOT / ".github/workflows" / workflow)
+    assert on["workflow_call"]["inputs"]["data_repo"]["required"] is True
+    data = [w for w in _checkouts(wf) if w.get("ref") == "factory-data"]
+    assert data and all(w["repository"] == "${{ inputs.data_repo }}" for w in data)
+
+
+@pytest.mark.parametrize("workflow", ["factory-evaluate.yml", "factory-improve.yml", "factory-metrics.yml"])
+def test_loops_are_reusable_and_run_from_the_data_repo(workflow):
+    wf, on = _wf(ROOT / ".github/workflows" / workflow)
+    # No schedule in the public repo: the private data repo's caller runs it, so its
+    # artifacts, logs and report issues are private.
+    assert set(on) == {"workflow_call"}
+    for w in _checkouts(wf):
+        if w.get("ref") == "factory-data":
+            assert "repository" not in w            # caller = the data repo
+        else:
+            assert w["repository"] == "${{ inputs.factory_repo }}"
+
+
+def test_improve_pr_goes_to_the_factory_repo():
+    run = _step("factory-improve.yml", "publish", "Commit, push and open the PR")
+    assert run.count('gh pr create --repo "$FACTORY_REPO"') == 2 and '--repo "$REPO"' not in run
+
+
+def test_callers_match_the_reusable_workflows():
+    cfg = _yaml.safe_load((ROOT / "factory/factory.yaml").read_text())
+    callers = {"templates/factory.yml": None}
+    callers.update({str(p.relative_to(ROOT)): None for p in (ROOT / "templates/data-repo/.github/workflows").glob("*.yml")})
+    assert len(callers) == 4
+    for path in callers:
+        wf, _ = _wf(ROOT / path)
+        for job in wf["jobs"].values():
+            target = job["uses"]
+            assert target.startswith(cfg["factory_repo"] + "/.github/workflows/") and target.endswith("@main")
+            _, on = _wf(ROOT / ".github/workflows" / target.split("/")[-1].split("@")[0])
+            call = on["workflow_call"]
+            needed_in = {k for k, v in call.get("inputs", {}).items() if v.get("required")}
+            assert needed_in <= set(job.get("with", {})), (path, needed_in)
+            assert job["with"]["factory_repo"] == cfg["factory_repo"]
+            if "data_repo" in job["with"]:
+                assert job["with"]["data_repo"] == cfg["data_repo"]
+            needed_sec = {k for k, v in (call.get("secrets") or {}).items() if v.get("required")}
+            assert needed_sec <= set(job.get("secrets", {})), (path, needed_sec)
+            assert job.get("secrets") != "inherit"

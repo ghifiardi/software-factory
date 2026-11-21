@@ -1,4 +1,5 @@
-# SELF-IMPROVEMENT LOOP — central factory repo, weekly.
+# SELF-IMPROVEMENT LOOP — reusable, called weekly from the PRIVATE data repo
+# (templates/data-repo/). The PR itself goes to the public factory repo.
 #   agent    reads the eval digest and edits files only (no shell, no git, read-only token)
 #   publish  fresh runner: applies the agent's diff, refuses anything outside
 #            improve.writable_paths, then commits, pushes and opens the PR with
@@ -6,9 +7,20 @@
 name: factory-improve
 
 on:
-  schedule:
-    - cron: "0 2 * * 1"   # Mondays UTC — keep in sync with factory.yaml → workflows.improve.trigger
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      factory_repo:
+        description: Public factory repo with the code, prompts and config (owner/name)
+        type: string
+        required: true
+      factory_ref:
+        type: string
+        default: main
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      FACTORY_TOKEN:
+        required: true   # pushes the proposal branch and opens the PR in the factory repo
 
 permissions: {}
 
@@ -31,6 +43,8 @@ jobs:
         run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v6
         with:
+          repository: ${{ inputs.factory_repo }}
+          ref: ${{ inputs.factory_ref }}
           persist-credentials: false
       - uses: actions/checkout@v6
         with:
@@ -82,12 +96,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write   # session record → factory-data (code branch + PR use FACTORY_TOKEN)
+      contents: write   # session record → factory-data in the data repo (proposal branch + PR use FACTORY_TOKEN)
     env:
-      REPO: ${{ github.repository }}
+      REPO: ${{ github.repository }}            # the data repo (session record metadata)
+      FACTORY_REPO: ${{ inputs.factory_repo }}  # where the proposal PR is opened
     steps:
       - uses: actions/checkout@v6
         with:
+          repository: ${{ inputs.factory_repo }}
+          ref: ${{ inputs.factory_ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/checkout@v6
@@ -153,10 +170,10 @@ jobs:
           fi
           printf '\n\n---\n_Opened by factory-improve run %s. Changes are limited to improve.writable_paths; human review required._\n' \
             "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$body"
-          gh pr create --repo "$REPO" --base main --head "$br" \
+          gh pr create --repo "$FACTORY_REPO" --base main --head "$br" \
             --title "factory(self-improvement): $(date -u +%F)" --body-file "$body" \
             --label factory:self-improvement \
-          || gh pr create --repo "$REPO" --base main --head "$br" \
+          || gh pr create --repo "$FACTORY_REPO" --base main --head "$br" \
             --title "factory(self-improvement): $(date -u +%F)" --body-file "$body"
 
       - name: No change proposed

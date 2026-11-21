@@ -29,6 +29,6 @@ jobs:
       - name: Unit tests
         run: python -m pytest -q tests
       - name: Lint workflows (catches unknown action inputs, bad expressions)
-        run: actionlint .github/workflows/*.yml templates/factory.yml
+        run: actionlint .github/workflows/*.yml templates/factory.yml templates/data-repo/.github/workflows/*.yml
       - name: Shell syntax
         run: bash -n scripts/*.sh

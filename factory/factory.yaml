@@ -6,8 +6,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 version: 1
 org: ghifiardi                    # GitHub account (personal account or org) that owns the factory
-factory_repo: ghifiardi/software-factory   # keep this repo PRIVATE
-data_branch: factory-data         # Layer 2 store. The workflows use this exact name.
+factory_repo: ghifiardi/software-factory        # PUBLIC: code, prompts, config. Public product repos can only call public workflows.
+data_repo: ghifiardi/software-factory-data      # PRIVATE: session records, evals, reports; runs evaluate/improve/metrics
+data_branch: factory-data         # Layer 2 store in data_repo. The workflows use this exact name.
 
 # Which product repos may use the factory. Start with one pilot repo.
 repos:

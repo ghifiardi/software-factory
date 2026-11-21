@@ -1,0 +1,22 @@
+# Lives on `main` of the PRIVATE data repo (installed by scripts/bootstrap.sh).
+# The proposal PR is opened in the public factory repo with FACTORY_TOKEN.
+# Keep it disabled (Actions tab) until ~20 sessions are recorded.
+name: factory-improve
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"   # Mondays UTC — keep in sync with factory.yaml → workflows.improve.trigger
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  improve:
+    permissions:
+      contents: write   # session record → factory-data
+    uses: ghifiardi/software-factory/.github/workflows/factory-improve.yml@main
+    with:
+      factory_repo: ghifiardi/software-factory
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      FACTORY_TOKEN: ${{ secrets.FACTORY_TOKEN }}

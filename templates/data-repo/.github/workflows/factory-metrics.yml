@@ -1,0 +1,26 @@
+# Lives on `main` of the PRIVATE data repo (installed by scripts/bootstrap.sh).
+# The weekly report issue is opened here, so it stays private.
+name: factory-metrics
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # Mondays UTC, after improve
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Window in days
+        default: "7"
+
+permissions: {}
+
+jobs:
+  metrics:
+    permissions:
+      contents: write   # archive the report on factory-data
+      issues: write     # publish the report issue
+    uses: ghifiardi/software-factory/.github/workflows/factory-metrics.yml@main
+    with:
+      factory_repo: ghifiardi/software-factory
+      days: ${{ inputs.days || '7' }}
+    secrets:
+      FACTORY_TOKEN: ${{ secrets.FACTORY_TOKEN }}

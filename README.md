@@ -17,7 +17,7 @@ as code, a closed SDLC loop, and measurement instead of vibes.
           policy: protected paths · max files  ──► violating PR auto-closed
                                            ▼
             session record (cost, turns, tools, redacted transcript)
-                                           ▼  factory-data branch
+                                           ▼  factory-data branch (private data repo)
    daily  EVALUATE ──► per-session quality + failure modes
    weekly IMPROVE  ──► ONE PR against factory/prompts or factory/evals ─► human review
    weekly METRICS  ──► report issue: throughput, human touches/PR, cycle time, $/PR
@@ -31,8 +31,18 @@ as code, a closed SDLC loop, and measurement instead of vibes.
 | 5 · Orchestration | `templates/factory.yml` + reusable workflows in `.github/workflows/` |
 | 4 · Inference & agents | `anthropics/claude-code-action@v1`; model per stage in `factory.yaml` |
 | 3 · Compute & sandboxing | Ephemeral GitHub-hosted runners, scoped `--allowedTools`, no unrestricted Bash |
-| 2 · Data & context | `factory-data` branch: `sessions/`, `evals/`, `reports/` |
+| 2 · Data & context | `factory-data` branch of the private data repo: `sessions/`, `evals/`, `reports/` |
 | 1 · Factories as code | `factory/factory.yaml`, `factory/prompts/`, `factory/evals/` — changed only by PR |
+
+## Two repos
+
+| Repo | Visibility | Holds |
+|---|---|---|
+| `ghifiardi/software-factory` (this one) | **public** | `factory.yaml`, prompts, rubric, scripts, reusable workflows. No data, no secrets. |
+| `ghifiardi/software-factory-data` | **private** | `factory-data` branch (session records with redacted transcripts, evals, reports), plus the schedules that run evaluate, improve and metrics, so their logs, artifacts and report issues stay private. |
+
+The factory repo has to be public because a public product repo like `tantular-cyber` can only call
+reusable workflows that live in a public repo. Anything sensitive lives in the data repo.
 
 ## Repo layout
 
@@ -42,8 +52,9 @@ factory/prompts/*.md           stage prompts (templated with {{vars}})
 factory/evals/failure_modes.yaml   online-eval rubric
 .github/workflows/factory-*.yml    reusable stages + scheduled loops + CI
 templates/factory.yml          the ONLY file a product repo needs
+templates/data-repo/           loop schedules bootstrap.sh installs on the data repo's main
 scripts/factory.py             gates, rendering, recording, digest, metrics (PyYAML only)
-scripts/bootstrap.sh           one-time setup (data branch, labels, access)
+scripts/bootstrap.sh           one-time setup (data repo, data branch, loop callers, labels, log key)
 scripts/push_data.sh           commit + push to factory-data with retries; token never written to disk
 tests/                         unit tests for the control script
 benchmarks/                    Phase 3: replay history across configs
@@ -56,24 +67,26 @@ Already configured in `factory/factory.yaml`: owner `ghifiardi`, pilot repo `tan
 offline benchmark), a pilot budget of $30 soft / $50 hard per month, and triage limited to
 trusted authors because the repo is public.
 
-1. **Create the factory repo** `ghifiardi/software-factory` — **private** — and push this folder to `main`.
-2. **Create `FACTORY_TOKEN`**: a fine-grained personal access token, repository access =
-   `software-factory` + `tantular-cyber`, permissions *Contents: read & write*,
+1. **Create the factory repo** `ghifiardi/software-factory` — **public** — and push this folder to `main`.
+2. **Bootstrap** from the factory repo checkout:
+   `./scripts/bootstrap.sh ghifiardi/software-factory ghifiardi/software-factory-data ghifiardi/tantular-cyber`
+   It creates the private data repo with its `factory-data` branch, installs the evaluate/improve/metrics
+   schedules on its `main` (evaluate and improve start disabled), makes the log-encryption key pair
+   (private key stays in `~/.config/software-factory/`, back it up), sets `FACTORY_LOG_KEY` in the
+   product repo, creates labels and lists any secret still missing.
+   Then commit and push `factory/log_public_key.pem`.
+3. **Create `FACTORY_TOKEN`**: a fine-grained personal access token, repository access =
+   `software-factory` + `software-factory-data` + `tantular-cyber`, permissions *Contents: read & write*,
    *Pull requests: read & write*, *Issues: read*, *Metadata: read*.
-3. **Add repo secrets** (personal accounts have no account-wide Actions secrets), in **both** repos:
+4. **Add repo secrets** (personal accounts have no account-wide Actions secrets) in the **data repo
+   and the product repo**. The public factory repo needs none.
    ```bash
-   gh secret set ANTHROPIC_API_KEY --repo ghifiardi/software-factory   # paste the key
+   gh secret set ANTHROPIC_API_KEY --repo ghifiardi/software-factory-data   # paste the key
    gh secret set ANTHROPIC_API_KEY --repo ghifiardi/tantular-cyber
-   gh secret set FACTORY_TOKEN     --repo ghifiardi/software-factory   # paste the PAT
+   gh secret set FACTORY_TOKEN     --repo ghifiardi/software-factory-data   # paste the PAT
    gh secret set FACTORY_TOKEN     --repo ghifiardi/tantular-cyber
    ```
    Use a key from its own Anthropic Console workspace with a spend limit.
-4. **Bootstrap** from the factory repo checkout:
-   `./scripts/bootstrap.sh ghifiardi/software-factory ghifiardi/tantular-cyber`
-   It creates the `factory-data` branch, lets your repos call the factory's workflows, makes the
-   log-encryption key pair (private key stays in `~/.config/software-factory/`, back it up), sets
-   `FACTORY_LOG_KEY` in the product repo, creates labels and lists any secret still missing.
-   Then commit and push `factory/log_public_key.pem`.
 5. **Protect `main`** in the factory repo: require the `factory-validate` status check and require
    PRs. Don't require an approving review: GitHub won't let you approve your own PRs, so that rule
    would block every self-improvement PR. You review them yourself before merging.
@@ -82,11 +95,12 @@ trusted authors because the repo is public.
 7. **Wire the pilot repo:** copy `templates/factory.yml` → `tantular-cyber/.github/workflows/factory.yml`.
 8. **Try it:** open a small, well-specified issue (e.g. a new Semgrep rule for one CWE with a
    vulnerable/clean fixture pair) → triage comments with a spec → add `factory:implement` →
-   review the PR. Turn on `factory-evaluate` / `factory-improve` once ~20 sessions are recorded
-   (disable them in the Actions tab until then).
+   review the PR. Turn on `factory-evaluate` / `factory-improve` in the **data repo's** Actions tab
+   once ~20 sessions are recorded.
 
-To add a repo later: add it to `repos.allow` and `repos.settings` (PR), set its two secrets, re-run
-`bootstrap.sh` with it (reuses the same key pair), install the Claude app, copy the caller workflow.
+To add a repo later: add it to `repos.allow` and `repos.settings` (PR), add it to `FACTORY_TOKEN`'s
+repository access, set its two secrets, re-run `bootstrap.sh` with it (reuses the same key pair),
+install the Claude app, copy the caller workflow.
 
 Run checks locally any time:
 ```bash
@@ -134,9 +148,12 @@ Residual risks to accept knowingly:
   Use a dedicated Console workspace with a spend limit for `ANTHROPIC_API_KEY`, and keep the trust gate on.
 - Run logs from product repos leave the agent job **encrypted** (RSA-OAEP + AES-256) to
   `factory/log_public_key.pem`, because artifacts on public repos are downloadable by anyone; only
-  the record job, holding `FACTORY_LOG_KEY`, can read them. Logs from evaluate/improve stay in the
-  private factory repo for up to 3 days. Only the stored session copy is redacted.
+  the record job, holding `FACTORY_LOG_KEY`, can read them. Evaluate/improve/metrics run from the
+  private data repo, so their logs, artifacts (kept up to 3 days) and report issues stay private.
+  Only the stored session copy is redacted.
+- Improve PRs are opened in the **public** factory repo. The improve prompt forbids quoting
+  transcripts, issue text or product code; read the PR body before merging anyway.
 - The agent job installs the project with `repos.settings.<repo>.setup` from `factory.yaml` — reviewed
   config, never issue text — so the agent can run the repo's real CI checks.
   Restrict who can read Actions artifacts in product repos.
-- Transcript redaction is regex-based; keep the factory repo private.
+- Transcript redaction is regex-based; keep the data repo private.

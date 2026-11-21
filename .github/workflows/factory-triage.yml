@@ -13,6 +13,10 @@ on:
       factory_ref:
         type: string
         default: main
+      data_repo:
+        description: Private repo whose factory-data branch holds session records (owner/name)
+        type: string
+        required: true
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -51,7 +55,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v6
         with:
-          repository: ${{ inputs.factory_repo }}
+          repository: ${{ inputs.data_repo }}
           ref: factory-data
           token: ${{ secrets.FACTORY_TOKEN }}
           path: .factory-data
@@ -166,7 +170,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v6
         with:
-          repository: ${{ inputs.factory_repo }}
+          repository: ${{ inputs.data_repo }}
           ref: factory-data
           token: ${{ secrets.FACTORY_TOKEN }}
           path: .factory-data

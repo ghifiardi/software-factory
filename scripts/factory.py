@@ -117,7 +117,7 @@ def is_bot(login: str | None) -> bool:
 def cmd_validate(a) -> int:
     cfg = load_config(a.config)
     errs = []
-    for key in ("version", "org", "factory_repo", "data_branch", "repos", "defaults", "budget", "policies", "workflows", "labels"):
+    for key in ("version", "org", "factory_repo", "data_repo", "data_branch", "repos", "defaults", "budget", "policies", "workflows", "labels"):
         if key not in cfg:
             errs.append(f"missing top-level key: {key}")
     wf = cfg.get("workflows", {})
@@ -139,6 +139,8 @@ def cmd_validate(a) -> int:
     prot = cfg.get("policies", {}).get("protected_paths", [])
     if ".github/workflows/**" not in prot:
         errs.append("policies.protected_paths must include .github/workflows/**")
+    if cfg.get("data_repo") and cfg.get("data_repo") == cfg.get("factory_repo"):
+        errs.append("data_repo must be a separate PRIVATE repo, not factory_repo (the factory repo is public)")
     if cfg.get("data_branch") != "factory-data":
         errs.append("data_branch must be 'factory-data' (the workflows use that name)")
     allow = cfg.get("repos", {}).get("allow", [])

@@ -1,13 +1,23 @@
-# ONLINE EVALS — runs in the CENTRAL factory repo, daily.
+# ONLINE EVALS — reusable, called daily from the PRIVATE data repo
+# (templates/data-repo/), so artifacts, logs and summaries stay private.
 #   agent    scores new implement sessions; read-only token, no shell, writes files only
 #   publish  fresh runner: accepts ONLY well-formed verdicts for the sessions that were
 #            pending, then pushes them to factory-data
 name: factory-evaluate
 
 on:
-  schedule:
-    - cron: "0 1 * * *"   # keep in sync with factory.yaml → workflows.evaluate.trigger
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      factory_repo:
+        description: Public factory repo with the code, prompts and config (owner/name)
+        type: string
+        required: true
+      factory_ref:
+        type: string
+        default: main
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
 
 permissions: {}
 
@@ -31,6 +41,8 @@ jobs:
         run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v6
         with:
+          repository: ${{ inputs.factory_repo }}
+          ref: ${{ inputs.factory_ref }}
           persist-credentials: false
       - uses: actions/checkout@v6
         with:
@@ -86,6 +98,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          repository: ${{ inputs.factory_repo }}
+          ref: ${{ inputs.factory_ref }}
           persist-credentials: false
       - uses: actions/checkout@v6
         with:

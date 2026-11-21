@@ -43,6 +43,8 @@ REQUIRED_STAGES = ("triage", "implement", "evaluate", "improve")
 
 # ───────────────────────── helpers ─────────────────────────
 # Which credential each inference provider needs (Layer 4). Switch with a PR to factory.yaml.
+HEADLESS_DISALLOWED = "Monitor"   # waits for notifications a headless session never gets
+
 PROVIDER_SECRETS = {
     "claude-subscription": "CLAUDE_CODE_OAUTH_TOKEN",   # `claude setup-token`; uses your Pro/Max plan
     "anthropic-api": "ANTHROPIC_API_KEY",               # pay-per-call API key
@@ -254,7 +256,9 @@ def cmd_render(a) -> int:
     rs = repo_settings(cfg, extra.get("repo", ""))
     if a.workflow == "implement" and rs.get("extra_tools"):
         tools = f"{tools},{rs['extra_tools']}"
-    claude_args = f'--model {model}\n--max-turns {turns}\n--allowedTools "{tools}"'
+    # Headless run: ending a turn ends the session, so nothing may wait in the background.
+    # Workflows also set CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 (removes run_in_background).
+    claude_args = f'--model {model}\n--max-turns {turns}\n--allowedTools "{tools}"\n--disallowedTools "{HEADLESS_DISALLOWED}"'
     gh_output(prompt=prompt_text, model=model, max_turns=turns, claude_args=claude_args,
               provider=inf["provider"],
               gateway_url=inf["gateway"].get("url", "") if inf["provider"] == "gateway" else "",

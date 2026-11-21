@@ -42,6 +42,28 @@ repos:
       checks:
         - "npm run deception-lab:typecheck"
         - "npm test"
+      # Research evidence and live-cloud scripts: an agent PR touching any of these is
+      # closed automatically. Results, recordings and the preregistration must only ever
+      # change by a human, and cloud/ scripts create real GCP VMs.
+      protected_paths:
+        - "experiments/preregistration/**"
+        - "experiments/results/**"
+        - "experiments/**/results/**"
+        - "experiments/defense/source-snapshots/**"
+        - "experiments/**/result-*"
+        - "experiments/**/RUNS.md"
+        - "experiments/**/*protocol*.json"
+        - "docs/research/**"
+        - "docs/METHODOLOGY.md"
+        - "docs/VALIDATED-DEFENSE.md"
+        - "**/*.docx"
+        - "**/*.pdf"
+        - "docs/evidence/**"
+        - "recordings/**"
+        - "paper/**"
+        - "cloud/**"
+        - "CITATION.cff"
+        - "PUBLISHING-AUDIT.md"
 
 # Who may trigger agents, by the issue author's relationship to the repo.
 # Labels can only be applied by people with triage+ permission (first gate);

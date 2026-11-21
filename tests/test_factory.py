@@ -405,3 +405,154 @@ def test_callers_match_the_reusable_workflows():
             needed_sec = {k for k, v in (call.get("secrets") or {}).items() if v.get("required")}
             assert needed_sec <= set(job.get("secrets", {})), (path, needed_sec)
             assert job.get("secrets") != "inherit"
+
+
+# ───────── inference providers: subscription · gateway · API key ─────────
+def _cfg_with(tmp_path, **inference):
+    cfg = _yaml.safe_load((ROOT / "factory/factory.yaml").read_text())
+    cfg["inference"].update(inference)
+    p = tmp_path / "f.yaml"; p.write_text(_yaml.safe_dump(cfg))
+    return p
+
+
+def _render_outputs(tmp_path, monkeypatch, cfg_path, stage="implement"):
+    out = tmp_path / "out.txt"; out.write_text("")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    assert factory.main(["--config", str(cfg_path), "render", "--workflow", stage, "--var", "repo=o/r",
+                         "--var", "issue_number=1", "--var", "base_branch=main"]) == 0
+    txt = out.read_text()
+    single = dict(line.split("=", 1) for line in txt.splitlines() if "=" in line and "<<" not in line.split("=", 1)[0])
+    return {k: single.get(k) for k in ("provider", "model", "gateway_url")}, txt
+
+
+def test_default_provider_is_the_claude_subscription(tmp_path, monkeypatch):
+    o, txt = _render_outputs(tmp_path, monkeypatch, ROOT / "factory/factory.yaml")
+    assert o["provider"] == "claude-subscription"
+    assert o["model"].startswith("claude-") and o["gateway_url"] == ""
+
+
+def test_gateway_provider_switches_every_stage_to_the_gateway_model(tmp_path, monkeypatch):
+    cfg = _cfg_with(tmp_path, provider="gateway")
+    for stage in ("triage", "implement", "evaluate", "improve"):
+        o, txt = _render_outputs(tmp_path, monkeypatch, cfg, stage)
+        assert o["provider"] == "gateway" and o["model"] == "ollama/gpt-oss:120b", stage
+        assert o["gateway_url"] == "https://openai2.ina17.com/anthropic"
+        assert "--model ollama/gpt-oss:120b" in txt
+
+
+@pytest.mark.parametrize("bad", [{"provider": "openai"}, {"provider": "gateway", "gateway": {"url": "http://x/anthropic", "model": "m"}},
+                                 {"provider": "gateway", "gateway": {"url": "https://x/anthropic"}}])
+def test_validate_rejects_bad_inference(tmp_path, bad):
+    assert factory.main(["--config", str(_cfg_with(tmp_path, **bad)), "validate"]) == 1
+
+
+@pytest.mark.parametrize("provider,secret", [("claude-subscription", "CLAUDE_CODE_OAUTH_TOKEN"),
+                                             ("gateway", "GATEWAY_KEY"), ("anthropic-api", "ANTHROPIC_API_KEY")])
+def test_check_inference_needs_the_providers_secret(tmp_path, monkeypatch, capsys, provider, secret):
+    cfg = _cfg_with(tmp_path, provider=provider)
+    for s in factory.PROVIDER_SECRETS.values():
+        monkeypatch.setenv(f"FACTORY_HAS_{s}", "true" if s != secret else "false")
+    assert factory.main(["--config", str(cfg), "check-inference"]) == 1
+    assert secret in capsys.readouterr().out
+    monkeypatch.setenv(f"FACTORY_HAS_{secret}", "true")
+    assert factory.main(["--config", str(cfg), "check-inference"]) == 0
+
+
+def test_budget_counts_sessions_for_all_providers_and_dollars_only_for_api(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    data = tmp_path / "data"
+    ex = _exec_file(tmp_path, cost=600)   # Claude Code's API-price estimate, not a bill
+    for run in ("1", "2", "3"):
+        factory.main(["record-session", "--data-dir", str(data), "--workflow", "implement", "--repo", "o/r",
+                      "--issue", "1", "--execution-file", str(ex), "--run-id", run, "--provider", "claude-subscription"])
+    rec = json.loads(next(data.rglob("*.json")).read_text())
+    assert rec["provider"] == "claude-subscription"
+    assert factory.monthly_spend(data, factory.month_key()) == 0
+    assert factory.monthly_sessions(data, factory.month_key()) == 3
+    cfg = _yaml.safe_load((ROOT / "factory/factory.yaml").read_text())
+    cfg["budget"]["monthly_session_limit"] = 3
+    p = tmp_path / "f.yaml"; p.write_text(_yaml.safe_dump(cfg))
+    assert factory.main(["--config", str(p), "check-budget", "--data-dir", str(data)]) == 1
+    assert "BUDGET EXCEEDED" in capsys.readouterr().out
+    cfg["budget"]["monthly_session_limit"] = 4
+    p.write_text(_yaml.safe_dump(cfg))
+    assert factory.main(["--config", str(p), "check-budget", "--data-dir", str(data)]) == 0
+
+
+AGENT_WORKFLOWS = ["factory-triage.yml", "factory-implement.yml", "factory-evaluate.yml", "factory-improve.yml"]
+
+
+@pytest.mark.parametrize("workflow", AGENT_WORKFLOWS)
+def test_agent_steps_pick_the_credential_from_the_provider(workflow):
+    text = (ROOT / ".github/workflows" / workflow).read_text()
+    wf, on = _wf(ROOT / ".github/workflows" / workflow)
+    declared = on["workflow_call"]["secrets"]
+    for s in factory.PROVIDER_SECRETS.values():
+        assert declared[s]["required"] is False
+    agents = [st for job in wf["jobs"].values() for st in job.get("steps", [])
+              if str(st.get("uses", "")).startswith("anthropics/claude-code-action")]
+    assert len(agents) == 1
+    w = agents[0]["with"]
+    assert "== 'anthropic-api' && secrets.ANTHROPIC_API_KEY" in w["anthropic_api_key"]
+    assert "== 'gateway' && 'gateway-shim'" in w["anthropic_api_key"]
+    assert "== 'claude-subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN" in w["claude_code_oauth_token"]
+    # The GATEWAY_KEY value reaches only the shim step's env: never job-wide, never GITHUB_ENV.
+    # (Gate steps may test whether it is set: `secrets.GATEWAY_KEY != ''` yields only true/false.)
+    for job in wf["jobs"].values():
+        assert "GATEWAY_KEY" not in json.dumps(job.get("env", {}))
+        for st in job.get("steps", []):
+            for k, v in (st.get("env") or {}).items():
+                if "secrets.GATEWAY_KEY" in str(v) and "!= ''" not in str(v):
+                    assert (st.get("name"), k) == ("Start the gateway shim", "GATEWAY_KEY")
+            if "GITHUB_ENV" in st.get("run", ""):
+                written = st["run"].split("GITHUB_ENV")[0]
+                assert "GATEWAY_KEY" not in written.split("{", 1)[-1] if "{" in written else True
+    assert text.count("secrets.GATEWAY_KEY }}") == 1
+
+
+# ───────── gateway shim ─────────
+import threading                                         # noqa: E402
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer   # noqa: E402
+import urllib.request                                    # noqa: E402
+
+
+def test_shim_merges_system_blocks_and_swaps_in_the_gateway_key(tmp_path):
+    seen = {}
+
+    class Upstream(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            seen["path"] = self.path
+            seen["auth"] = self.headers.get("authorization")
+            seen["x_api_key"] = self.headers.get("x-api-key")
+            seen["body"] = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            out = b"event: message_start\ndata: {}\n\n" * 3
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    port = up.server_address[1] + 1
+    env = {**os.environ, "GATEWAY_URL": f"http://127.0.0.1:{up.server_address[1]}/anthropic", "GATEWAY_KEY": "real-key"}
+    shim = subprocess.Popen([sys.executable, str(ROOT / "scripts/gateway_shim.py"), str(port)], env=env)
+    try:
+        body = {"model": "m", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}],
+                "system": [{"type": "text", "text": "A"}, {"type": "text", "text": "B", "cache_control": {"type": "ephemeral"}}]}
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                     headers={"content-type": "application/json", "x-api-key": "gateway-shim"})
+        for _ in range(50):
+            try:
+                resp = urllib.request.urlopen(req, timeout=5); break
+            except urllib.error.URLError:
+                import time; time.sleep(0.1)
+        assert resp.status == 200 and resp.read() == b"event: message_start\ndata: {}\n\n" * 3
+        assert seen["path"] == "/anthropic/v1/messages"
+        assert seen["body"]["system"] == [{"type": "text", "text": "A\n\nB"}]
+        assert seen["auth"] == "Bearer real-key" and seen["x_api_key"] is None   # client's placeholder never forwarded
+    finally:
+        shim.terminate(); shim.wait(); up.shutdown()

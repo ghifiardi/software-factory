@@ -7,6 +7,7 @@ One small, dependency-light tool (PyYAML only) used by every workflow:
   render          render a stage prompt + emit model/turns/tools to $GITHUB_OUTPUT
   check-access    is this repo / author allowed to use the factory?
   check-budget    has this month's recorded spend hit the hard limit?
+  check-inference is the active provider's secret present? (workflows pass FACTORY_HAS_<SECRET>)
   check-paths     does an agent branch touch protected paths / too many files?
   record-session  turn a claude-code-action execution file into a session record (Layer 2)
   pending-evals   list session records that have no eval yet
@@ -41,6 +42,28 @@ REQUIRED_STAGES = ("triage", "implement", "evaluate", "improve")
 
 
 # ───────────────────────── helpers ─────────────────────────
+# Which credential each inference provider needs (Layer 4). Switch with a PR to factory.yaml.
+PROVIDER_SECRETS = {
+    "claude-subscription": "CLAUDE_CODE_OAUTH_TOKEN",   # `claude setup-token`; uses your Pro/Max plan
+    "anthropic-api": "ANTHROPIC_API_KEY",               # pay-per-call API key
+    "gateway": "GATEWAY_KEY",                           # your own Anthropic-compatible gateway (via gateway_shim.py)
+}
+
+
+def inference(cfg: dict) -> dict:
+    inf = cfg.get("inference") or {}
+    return {"provider": inf.get("provider", "anthropic-api"), "gateway": inf.get("gateway") or {}}
+
+
+def stage_model(cfg: dict, stage_name: str) -> str:
+    """Model id for a stage under the active provider."""
+    stage = cfg["workflows"][stage_name]
+    inf = inference(cfg)
+    if inf["provider"] == "gateway":
+        return stage.get("gateway_model") or inf["gateway"].get("model", "")
+    return stage.get("model", cfg["defaults"]["model"])
+
+
 def load_config(path: str | Path = DEFAULT_CONFIG) -> dict:
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -133,7 +156,22 @@ def cmd_validate(a) -> int:
             errs.append(f"{stage}: unrestricted Bash is not allowed; scope it e.g. Bash(git:*)")
         if stage in ("evaluate", "improve") and "Bash" in tools:
             errs.append(f"{stage}: must not have shell access; it only edits files and a later job publishes them")
+    inf = inference(cfg)
+    if inf["provider"] not in PROVIDER_SECRETS:
+        errs.append(f"inference.provider must be one of {sorted(PROVIDER_SECRETS)}, got {inf['provider']!r}")
+    if inf["provider"] == "gateway":
+        url = str(inf["gateway"].get("url", ""))
+        if not url.startswith("https://"):
+            errs.append("inference.gateway.url must be an https:// URL (the key travels to it)")
+        if not inf["gateway"].get("model"):
+            errs.append("inference.gateway.model is required when provider is gateway")
+    for name, st in wf.items():
+        for key in ("model", "gateway_model"):
+            if key in st and not re.fullmatch(r"[A-Za-z0-9._:/@-]+", str(st[key])):
+                errs.append(f"{name}.{key}: invalid model id {st[key]!r}")
     b = cfg.get("budget", {})
+    if "monthly_session_limit" in b and not (isinstance(b["monthly_session_limit"], int) and b["monthly_session_limit"] >= 0):
+        errs.append("budget.monthly_session_limit must be a whole number >= 0")
     if b and b.get("monthly_soft_limit_usd", 0) > b.get("monthly_hard_limit_usd", 0):
         errs.append("budget: soft limit must be <= hard limit")
     prot = cfg.get("policies", {}).get("protected_paths", [])
@@ -209,7 +247,8 @@ def cmd_render(a) -> int:
     extra = dict(v.split("=", 1) for v in (a.var or []))
     extra.setdefault("date", dt.date.today().isoformat())
     prompt_text = render_template((ROOT / "factory" / stage["prompt"]).read_text(encoding="utf-8"), build_context(cfg, extra))
-    model = stage.get("model", cfg["defaults"]["model"])
+    model = stage_model(cfg, a.workflow)
+    inf = inference(cfg)
     turns = min(int(stage.get("max_turns", cfg["defaults"]["max_turns"])), int(cfg["budget"]["per_session_max_turns"]) if a.workflow == "implement" else 10**6)
     tools = stage["allowed_tools"]
     rs = repo_settings(cfg, extra.get("repo", ""))
@@ -217,6 +256,8 @@ def cmd_render(a) -> int:
         tools = f"{tools},{rs['extra_tools']}"
     claude_args = f'--model {model}\n--max-turns {turns}\n--allowedTools "{tools}"'
     gh_output(prompt=prompt_text, model=model, max_turns=turns, claude_args=claude_args,
+              provider=inf["provider"],
+              gateway_url=inf["gateway"].get("url", "") if inf["provider"] == "gateway" else "",
               allowed_tools=tools, timeout_s=int(cfg["defaults"].get("timeout_minutes", 45)) * 60,
               timeout_minutes=cfg["defaults"].get("timeout_minutes", 45),
               python_version=rs.get("python", ""), node_version=rs.get("node", ""),
@@ -248,12 +289,32 @@ def cmd_check_access(a) -> int:
     return 0
 
 
+def cmd_check_inference(a) -> int:
+    """Fail clearly when the active provider's secret is missing. Workflows pass
+    FACTORY_HAS_<SECRET>=true|false (never the secret itself)."""
+    cfg = load_config(a.config)
+    provider = inference(cfg)["provider"]
+    secret = PROVIDER_SECRETS.get(provider)
+    if secret is None:
+        print(f"DENY: unknown inference.provider {provider!r}"); return 1
+    if os.environ.get(f"FACTORY_HAS_{secret}", "").lower() != "true":
+        print(f"DENY: inference.provider is {provider} but the {secret} secret is not set in this repo"); return 1
+    print(f"ALLOW: inference via {provider}")
+    return 0
+
+
 def monthly_spend(data_dir: Path, month: str) -> float:
+    """Real money spent: only pay-per-call sessions count. Subscription and gateway
+    sessions report Claude Code's API-price estimate, which nobody is billed."""
     total = 0.0
     for _, rec in iter_json(data_dir / "sessions"):
-        if month_key(rec.get("started_at")) == month:
+        if month_key(rec.get("started_at")) == month and rec.get("provider", "anthropic-api") == "anthropic-api":
             total += float(rec.get("metrics", {}).get("cost_usd") or 0)
     return round(total, 4)
+
+
+def monthly_sessions(data_dir: Path, month: str) -> int:
+    return sum(1 for _, rec in iter_json(data_dir / "sessions") if month_key(rec.get("started_at")) == month)
 
 
 def cmd_check_budget(a) -> int:
@@ -261,12 +322,16 @@ def cmd_check_budget(a) -> int:
     spend = monthly_spend(Path(a.data_dir), month_key())
     hard = cfg["budget"]["monthly_hard_limit_usd"]
     soft = cfg["budget"]["monthly_soft_limit_usd"]
-    gh_output(spend_usd=spend)
+    sessions = monthly_sessions(Path(a.data_dir), month_key())
+    cap = cfg["budget"].get("monthly_session_limit")
+    gh_output(spend_usd=spend, sessions=sessions)
+    if cap is not None and sessions >= cap:
+        print(f"BUDGET EXCEEDED: {sessions} agent sessions this month >= monthly_session_limit {cap}"); return 1
     if spend >= hard:
         print(f"BUDGET EXCEEDED: ${spend:.2f} >= hard limit ${hard}"); return 1
     if spend >= soft:
         print(f"::warning::Factory spend ${spend:.2f} passed soft limit ${soft}")
-    print(f"budget ok: ${spend:.2f} of ${hard}")
+    print(f"budget ok: ${spend:.2f} of ${hard}" + (f", {sessions} of {cap} sessions" if cap is not None else ""))
     return 0
 
 
@@ -401,6 +466,7 @@ def cmd_record_session(a) -> int:
         "conclusion": a.conclusion,
         "policy_violations": [v for v in (a.violations or "").splitlines() if v and v != "none"],
         "model": a.model,
+        "provider": a.provider or "anthropic-api",
         "run_url": a.run_url,
         "started_at": started,
         "recorded_at": now.isoformat(),
@@ -613,6 +679,7 @@ def main(argv=None) -> int:
     c = sp.add_parser("check-access"); c.add_argument("--repo", required=True); c.add_argument("--author-association")
     c.add_argument("--stage", choices=["triage", "implement"], help="which trust list to apply (default: implement)")
     c = sp.add_parser("check-budget"); c.add_argument("--data-dir", required=True)
+    sp.add_parser("check-inference")
     c = sp.add_parser("check-paths"); c.add_argument("--base"); c.add_argument("--head"); c.add_argument("--repo-dir", default=".")
     c.add_argument("--files", help="comma-separated list instead of git diff (tests/local use)")
     c.add_argument("--files-from", help="NUL-separated file list, e.g. from `git apply --numstat -z`")
@@ -620,7 +687,7 @@ def main(argv=None) -> int:
     c.add_argument("--allow", action="append", help="allow only paths matching this glob (repeatable)")
     s = sp.add_parser("record-session")
     for f in ("execution-file", "workflow", "repo", "issue", "pr-url", "branch", "conclusion", "violations",
-              "model", "run-id", "run-url", "session-id", "started-at", "diff-stat"):
+              "model", "provider", "run-id", "run-url", "session-id", "started-at", "diff-stat"):
         s.add_argument(f"--{f}")
     s.add_argument("--data-dir", required=True)
     e = sp.add_parser("pending-evals"); e.add_argument("--data-dir", required=True); e.add_argument("--out", default="to_evaluate.txt"); e.add_argument("--limit", type=int, default=40)
@@ -630,7 +697,7 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     return {
         "validate": cmd_validate, "render": cmd_render, "check-access": cmd_check_access,
-        "check-budget": cmd_check_budget, "check-paths": cmd_check_paths, "record-session": cmd_record_session,
+        "check-budget": cmd_check_budget, "check-inference": cmd_check_inference, "check-paths": cmd_check_paths, "record-session": cmd_record_session,
         "pending-evals": cmd_pending_evals, "digest": cmd_digest, "metrics": cmd_metrics,
     }[a.cmd](a)
 

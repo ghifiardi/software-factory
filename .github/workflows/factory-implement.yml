@@ -23,7 +23,11 @@ on:
         required: true
     secrets:
       ANTHROPIC_API_KEY:
-        required: true
+        required: false   # inference.provider: anthropic-api
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false   # inference.provider: claude-subscription
+      GATEWAY_KEY:
+        required: false   # inference.provider: gateway
       FACTORY_TOKEN:
         required: true
       FACTORY_LOG_KEY:
@@ -46,6 +50,9 @@ jobs:
       prompt: ${{ steps.cfg.outputs.prompt }}
       claude_args: ${{ steps.cfg.outputs.claude_args }}
       model: ${{ steps.cfg.outputs.model }}
+      provider: ${{ steps.cfg.outputs.provider }}
+      gateway_url: ${{ steps.cfg.outputs.gateway_url }}
+      shim: ${{ steps.shim.outputs.b64 }}
       started_at: ${{ steps.start.outputs.at }}
       python_version: ${{ steps.cfg.outputs.python_version }}
       node_version: ${{ steps.cfg.outputs.node_version }}
@@ -79,6 +86,11 @@ jobs:
           python-version: "3.12"
       - run: pip install --quiet pyyaml
 
+      # The agent job has no factory checkout, so it gets the shim (same ref) from here.
+      - name: Package the gateway shim
+        id: shim
+        run: echo "b64=$(base64 -w0 .factory/scripts/gateway_shim.py)" >> "$GITHUB_OUTPUT"
+
       - name: Load the log-encryption public key
         id: logkey
         run: |
@@ -92,10 +104,14 @@ jobs:
         id: gate
         env:
           ASSOC: ${{ github.event.issue.author_association }}
+          FACTORY_HAS_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          FACTORY_HAS_CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          FACTORY_HAS_GATEWAY_KEY: ${{ secrets.GATEWAY_KEY != '' }}
         run: |
           reasons="$RUNNER_TEMP/gate.txt"; : > "$reasons"
           python .factory/scripts/factory.py check-access --repo "$REPO" --author-association "$ASSOC" --stage implement >> "$reasons" 2>&1 || echo FAIL >> "$reasons.flag"
           python .factory/scripts/factory.py check-budget --data-dir .factory-data >> "$reasons" 2>&1 || echo FAIL >> "$reasons.flag"
+          python .factory/scripts/factory.py check-inference >> "$reasons" 2>&1 || echo FAIL >> "$reasons.flag"
           cat "$reasons"
           if [ -s "$reasons.flag" ]; then echo "allowed=false" >> "$GITHUB_OUTPUT"; else echo "allowed=true" >> "$GITHUB_OUTPUT"; fi
 
@@ -170,11 +186,32 @@ jobs:
             echo "no setup command configured for this repo"
           fi
 
+      # inference.provider = gateway: a local shim fixes the request shape for the gateway
+      # and adds GATEWAY_KEY, which only this step and the shim process see.
+      - name: Start the gateway shim
+        if: needs.prepare.outputs.provider == 'gateway'
+        env:
+          GATEWAY_URL: ${{ needs.prepare.outputs.gateway_url }}
+          GATEWAY_KEY: ${{ secrets.GATEWAY_KEY }}
+          AGENT_MODEL: ${{ needs.prepare.outputs.model }}
+          SHIM_B64: ${{ needs.prepare.outputs.shim }}
+        run: |
+          printf '%s' "$SHIM_B64" | base64 -d > "$RUNNER_TEMP/gateway_shim.py"
+          nohup python3 "$RUNNER_TEMP/gateway_shim.py" 8787 > "$RUNNER_TEMP/gateway_shim.log" 2>&1 &
+          for _ in $(seq 1 20); do curl -s -o /dev/null http://127.0.0.1:8787/ && break; sleep 0.5; done
+          {
+            echo "ANTHROPIC_BASE_URL=http://127.0.0.1:8787"
+            echo "ANTHROPIC_DEFAULT_SONNET_MODEL=$AGENT_MODEL"
+            echo "ANTHROPIC_DEFAULT_HAIKU_MODEL=$AGENT_MODEL"
+            echo "ANTHROPIC_DEFAULT_OPUS_MODEL=$AGENT_MODEL"
+          } >> "$GITHUB_ENV"
+
       - name: Run coding agent
         id: agent
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ needs.prepare.outputs.provider == 'anthropic-api' && secrets.ANTHROPIC_API_KEY || needs.prepare.outputs.provider == 'gateway' && 'gateway-shim' || '' }}
+          claude_code_oauth_token: ${{ needs.prepare.outputs.provider == 'claude-subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           prompt: ${{ needs.prepare.outputs.prompt }}
           claude_args: ${{ needs.prepare.outputs.claude_args }}
 
@@ -334,6 +371,7 @@ jobs:
           CONCLUSION: ${{ needs.agent.result }}
           PR_URL: ${{ steps.pr.outputs.url }}
           MODEL: ${{ needs.prepare.outputs.model }}
+          PROVIDER: ${{ needs.prepare.outputs.provider }}
           STARTED: ${{ needs.prepare.outputs.started_at }}
           DIFF_STAT: ${{ steps.pr.outputs.stat }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -345,7 +383,7 @@ jobs:
           python .factory/scripts/factory.py record-session --data-dir .factory-data \
             --workflow implement --repo "$REPO" --issue "$ISSUE" \
             --execution-file "$exec_file" --session-id "$SESSION_ID" --conclusion "$CONCLUSION" \
-            --pr-url "$PR_URL" --branch "$BRANCH" --violations "$violations" --model "$MODEL" \
+            --pr-url "$PR_URL" --branch "$BRANCH" --violations "$violations" --model "$MODEL" --provider "$PROVIDER" \
             --run-id "$RUN_ID" --run-url "$RUN_URL" --started-at "$STARTED" --diff-stat "$DIFF_STAT"
 
       - name: Push session record

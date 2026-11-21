@@ -14,6 +14,7 @@ data_branch: factory-data         # Layer 2 store in data_repo. The workflows us
 repos:
   allow:
     - ghifiardi/tantular-cyber
+    - ghifiardi/AI-Deception-Lab
   # deny wins over allow
   deny: []
 
@@ -34,6 +35,13 @@ repos:
         - "tantular-cyber benchmark --corpus benchmarks/corpus --output out/benchmark-ci"
       # Extra commands the implement agent may run for this repo.
       extra_tools: "Bash(ruff:*),Bash(tantular-cyber benchmark:*)"
+    ghifiardi/AI-Deception-Lab:
+      node: "22"
+      setup: "npm ci"
+      # Same gates as the repo's own CI (.github/workflows/ci.yml).
+      checks:
+        - "npm run deception-lab:typecheck"
+        - "npm test"
 
 # Who may trigger agents, by the issue author's relationship to the repo.
 # Labels can only be applied by people with triage+ permission (first gate);

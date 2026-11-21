@@ -66,9 +66,28 @@ def stage_model(cfg: dict, stage_name: str) -> str:
     return stage.get("model", cfg["defaults"]["model"])
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that refuses duplicate mapping keys. Plain YAML keeps the last one
+    silently, so a second `repos.settings.<repo>` block could quietly replace a stricter one."""
+
+
+def _unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False) -> dict:
+    seen = set()
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                None, None, f"duplicate key {key!r}", key_node.start_mark)
+        seen.add(key)
+    return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _unique_mapping)
+
+
 def load_config(path: str | Path = DEFAULT_CONFIG) -> dict:
     with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.load(f, Loader=_UniqueKeyLoader)  # noqa: S506 — SafeLoader subclass
 
 
 def gh_output(**kv: str) -> None:
@@ -140,7 +159,11 @@ def is_bot(login: str | None) -> bool:
 
 # ───────────────────────── validate ─────────────────────────
 def cmd_validate(a) -> int:
-    cfg = load_config(a.config)
+    try:
+        cfg = load_config(a.config)
+    except yaml.YAMLError as e:
+        print(f"factory.yaml INVALID:\n  - {e}")
+        return 1
     errs = []
     for key in ("version", "org", "factory_repo", "data_repo", "data_branch", "repos", "defaults", "budget", "policies", "workflows", "labels"):
         if key not in cfg:
@@ -187,7 +210,10 @@ def cmd_validate(a) -> int:
     for repo, rs in (cfg.get("repos", {}).get("settings") or {}).items():
         if not any(fnmatch.fnmatch(repo, pat) for pat in allow):
             errs.append(f"repos.settings.{repo}: not in repos.allow")
-        unknown = set(rs) - {"python", "node", "setup", "env", "checks", "extra_tools"}
+        unknown = set(rs) - {"python", "node", "setup", "env", "checks", "extra_tools", "protected_paths"}
+        pp = rs.get("protected_paths", [])
+        if not isinstance(pp, list) or not all(isinstance(x, str) and x.strip() for x in pp):
+            errs.append(f"repos.settings.{repo}.protected_paths: must be a list of glob strings")
         if unknown:
             errs.append(f"repos.settings.{repo}: unknown keys {sorted(unknown)}")
         et = rs.get("extra_tools", "")
@@ -223,11 +249,17 @@ def cmd_validate(a) -> int:
 
 
 # ───────────────────────── render ─────────────────────────
+def protected_for(cfg: dict, repo: str) -> list[str]:
+    """Global protected paths plus the repo's own (repos.settings.<repo>.protected_paths)."""
+    extra = repo_settings(cfg, repo).get("protected_paths", []) if repo else []
+    return list(cfg.get("policies", {}).get("protected_paths", [])) + [p for p in extra if isinstance(p, str)]
+
+
 def build_context(cfg: dict, extra: dict) -> dict:
     ctx = {
         "org": cfg.get("org"),
         "labels": cfg.get("labels", {}),
-        "protected_paths": cfg.get("policies", {}).get("protected_paths", []),
+        "protected_paths": protected_for(cfg, extra.get("repo", "")),
         "max_files_changed": cfg.get("policies", {}).get("max_files_changed", 25),
         "writable_paths": cfg.get("workflows", {}).get("improve", {}).get("writable_paths", []),
         "checks": "   - the project's test command (see README / CI)",
@@ -373,7 +405,9 @@ def cmd_check_paths(a) -> int:
         problems = [f"outside allowed paths {a.allow}: {f!r}" for f in files
                     if not any(glob_match(f, p) for p in a.allow) or ".." in f.split("/")]
     else:
-        protected = pol["protected_paths"] if not a.allowlist else []
+        # Per-repo protection: --repo, or $REPO which the record job already sets.
+        repo = a.repo or os.environ.get("REPO", "")
+        protected = protected_for(cfg, repo) if not a.allowlist else []
         problems = evaluate_paths(files, protected, pol.get("max_files_changed", 25))
         if a.allowlist:  # inverse mode for the improve stage
             allow = cfg["workflows"]["improve"]["writable_paths"]
@@ -689,6 +723,7 @@ def main(argv=None) -> int:
     c.add_argument("--files-from", help="NUL-separated file list, e.g. from `git apply --numstat -z`")
     c.add_argument("--allowlist", action="store_true", help="improve-stage mode: only writable_paths allowed")
     c.add_argument("--allow", action="append", help="allow only paths matching this glob (repeatable)")
+    c.add_argument("--repo", help="product repo (owner/name) whose extra protected_paths apply; default $REPO")
     s = sp.add_parser("record-session")
     for f in ("execution-file", "workflow", "repo", "issue", "pr-url", "branch", "conclusion", "violations",
               "model", "provider", "run-id", "run-url", "session-id", "started-at", "diff-stat"):

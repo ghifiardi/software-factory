@@ -579,3 +579,63 @@ def test_render_blocks_monitor_and_implement_prompt_explains_headless(tmp_path, 
     assert '--disallowedTools "Monitor"' in txt
     assert "--max-turns 60" in txt
     assert "non-interactive run" in txt and "Never start work in the\nbackground" in txt
+
+
+# ───────── per-repo protected paths (AI-Deception-Lab research evidence) ─────────
+ADL = "ghifiardi/AI-Deception-Lab"
+
+
+@pytest.mark.parametrize("path,blocked", [
+    ("experiments/results/run-01.json", True),
+    ("experiments/swarm/results/2026-11-14/summary.json", True),
+    ("experiments/defense/result-2026-11-13T07-57-58-061Z.json", True),
+    ("experiments/preregistration/H1.md", True),
+    ("experiments/swarm/baseline-protocol.json", True),
+    ("docs/evidence/2026-11-13-gcp-test.md", True),
+    ("docs/research/preprint.md", True),
+    ("paper/main.tex", True),
+    ("cloud/gcp/lab.sh", True),
+    ("recordings/demo.webm", True),
+    ("CITATION.cff", True),
+    ("src/engine/sim.ts", False),
+    ("tests/defense.test.ts", False),
+    ("experiments/stats.mjs", False),
+])
+def test_ai_deception_lab_protected_paths(tmp_path, monkeypatch, path, blocked):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    f = _nul(tmp_path, [path])
+    assert (factory.main(["check-paths", "--repo", ADL, "--files-from", f]) == 1) is blocked
+    # the record job passes the repo via $REPO, not --repo
+    monkeypatch.setenv("REPO", ADL)
+    assert (factory.main(["check-paths", "--files-from", f]) == 1) is blocked
+
+
+def test_repo_protection_does_not_leak_to_other_repos(tmp_path, monkeypatch):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    f = _nul(tmp_path, ["paper/main.tex"])
+    assert factory.main(["check-paths", "--repo", "ghifiardi/tantular-cyber", "--files-from", f]) == 0
+
+
+def test_implement_prompt_lists_repo_protected_paths(tmp_path, monkeypatch):
+    out = tmp_path / "o"; out.write_text(""); monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    assert factory.main(["render", "--workflow", "implement", "--var", f"repo={ADL}",
+                         "--var", "issue_number=1", "--var", "base_branch=main"]) == 0
+    text = out.read_text()
+    assert "`experiments/results/**`" in text and "`.github/workflows/**`" in text
+    assert "node_version=22" in text and "npm ci" in text and "`npm test`" in text
+
+
+def test_validate_rejects_bad_repo_protected_paths(tmp_path):
+    cfg = _yaml.safe_load((ROOT / "factory/factory.yaml").read_text())
+    cfg["repos"]["settings"][ADL]["protected_paths"] = "paper/**"
+    p = tmp_path / "f.yaml"; p.write_text(_yaml.safe_dump(cfg))
+    assert factory.main(["--config", str(p), "validate"]) == 1
+
+
+def test_validate_rejects_duplicate_keys(tmp_path):
+    text = (ROOT / "factory/factory.yaml").read_text()
+    dup = text.replace("    ghifiardi/AI-Deception-Lab:\n",
+                       "    ghifiardi/AI-Deception-Lab:\n      node: \"22\"\n    ghifiardi/AI-Deception-Lab:\n", 1)
+    assert dup != text
+    p = tmp_path / "f.yaml"; p.write_text(dup)
+    assert factory.main(["--config", str(p), "validate"]) == 1

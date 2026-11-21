@@ -1,0 +1,361 @@
+# IMPLEMENT stage — reusable, called from each PRODUCT repo (templates/factory.yml)
+# when someone adds the factory:implement label.
+#
+# Three jobs so the agent never sits next to the factory's credentials:
+#   prepare  gates (allowlist · author trust · budget) + render config   [FACTORY_TOKEN, read-only]
+#   agent    Claude Code in a clean product checkout                     [no FACTORY_TOKEN]
+#   record   policy enforcement on the agent's branch + session record   [FACTORY_TOKEN, fresh runner]
+name: factory-implement
+
+on:
+  workflow_call:
+    inputs:
+      factory_repo:
+        description: Central factory repo (owner/name)
+        type: string
+        required: true
+      factory_ref:
+        type: string
+        default: main
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      FACTORY_TOKEN:
+        required: true
+      FACTORY_LOG_KEY:
+        required: false   # private half of factory/log_public_key.pem
+
+permissions: {}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      REPO: ${{ github.repository }}
+      ISSUE: ${{ github.event.issue.number }}
+    outputs:
+      allowed: ${{ steps.gate.outputs.allowed }}
+      prompt: ${{ steps.cfg.outputs.prompt }}
+      claude_args: ${{ steps.cfg.outputs.claude_args }}
+      model: ${{ steps.cfg.outputs.model }}
+      started_at: ${{ steps.start.outputs.at }}
+      python_version: ${{ steps.cfg.outputs.python_version }}
+      node_version: ${{ steps.cfg.outputs.node_version }}
+      setup_command: ${{ steps.cfg.outputs.setup_command }}
+      setup_env: ${{ steps.cfg.outputs.setup_env }}
+      log_public_key: ${{ steps.logkey.outputs.pem }}
+    steps:
+      - id: start
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Check out factory definition
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.factory_repo }}
+          ref: ${{ inputs.factory_ref }}
+          token: ${{ secrets.FACTORY_TOKEN }}
+          path: .factory
+          persist-credentials: false
+
+      - name: Check out factory data (budget gate)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.factory_repo }}
+          ref: factory-data
+          token: ${{ secrets.FACTORY_TOKEN }}
+          path: .factory-data
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+
+      - name: Load the log-encryption public key
+        id: logkey
+        run: |
+          if [ -f .factory/factory/log_public_key.pem ]; then
+            { echo 'pem<<PEM_EOF'; cat .factory/factory/log_public_key.pem; echo 'PEM_EOF'; } >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::factory/log_public_key.pem missing — transcripts will not be kept"
+          fi
+
+      - name: Gate — repo allowlist · issue author trust · monthly budget
+        id: gate
+        env:
+          ASSOC: ${{ github.event.issue.author_association }}
+        run: |
+          reasons="$RUNNER_TEMP/gate.txt"; : > "$reasons"
+          python .factory/scripts/factory.py check-access --repo "$REPO" --author-association "$ASSOC" --stage implement >> "$reasons" 2>&1 || echo FAIL >> "$reasons.flag"
+          python .factory/scripts/factory.py check-budget --data-dir .factory-data >> "$reasons" 2>&1 || echo FAIL >> "$reasons.flag"
+          cat "$reasons"
+          if [ -s "$reasons.flag" ]; then echo "allowed=false" >> "$GITHUB_OUTPUT"; else echo "allowed=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Explain a blocked run on the issue
+        if: steps.gate.outputs.allowed == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          {
+            echo "⛔ **The software factory did not start** for this issue:"
+            echo
+            echo '```'
+            grep -E 'DENY|BUDGET' "$RUNNER_TEMP/gate.txt" || cat "$RUNNER_TEMP/gate.txt"
+            echo '```'
+            echo
+            echo "Once resolved, remove and re-add the \`$LABEL\` label to retry."
+          } > "$RUNNER_TEMP/body.md"
+          gh issue comment "$ISSUE" --repo "$REPO" --body-file "$RUNNER_TEMP/body.md"
+          gh issue edit "$ISSUE" --repo "$REPO" --remove-label "$LABEL" || true
+
+      - name: Render stage config from factory.yaml
+        id: cfg
+        if: steps.gate.outputs.allowed == 'true'
+        env:
+          BASE: ${{ github.event.repository.default_branch }}
+        run: >
+          python .factory/scripts/factory.py render --workflow implement
+          --var "repo=$REPO" --var "issue_number=$ISSUE" --var "base_branch=$BASE"
+
+  agent:
+    needs: prepare
+    if: needs.prepare.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    concurrency:
+      group: factory-implement-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write   # the action exchanges this for a Claude GitHub App token, so its PRs trigger CI
+    outputs:
+      session_id: ${{ steps.agent.outputs.session_id }}
+    steps:
+      - name: Check out product repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        if: needs.prepare.outputs.python_version != ''
+        with:
+          python-version: ${{ needs.prepare.outputs.python_version }}
+      - uses: actions/setup-node@v4
+        if: needs.prepare.outputs.node_version != ''
+        with:
+          node-version: ${{ needs.prepare.outputs.node_version }}
+
+      # From repos.settings in factory.yaml (reviewed config), never from the issue.
+      - name: Install the project so the agent can run its checks
+        env:
+          SETUP_COMMAND: ${{ needs.prepare.outputs.setup_command }}
+          SETUP_ENV: ${{ needs.prepare.outputs.setup_env }}
+        run: |
+          if [ -n "$SETUP_ENV" ]; then printf '%s\n' "$SETUP_ENV" >> "$GITHUB_ENV"; fi
+          if [ -n "$SETUP_COMMAND" ]; then
+            while IFS='=' read -r k v; do [ -n "$k" ] && export "$k=$v"; done <<< "$SETUP_ENV"
+            bash -euo pipefail -c "$SETUP_COMMAND"
+          else
+            echo "no setup command configured for this repo"
+          fi
+
+      - name: Run coding agent
+        id: agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ needs.prepare.outputs.prompt }}
+          claude_args: ${{ needs.prepare.outputs.claude_args }}
+
+      # Public repos expose workflow artifacts to anyone, so the raw run log leaves this
+      # job only encrypted to the factory's public key (no secret is needed to encrypt).
+      - name: Encrypt the execution log for the record job
+        id: enc
+        if: always() && steps.agent.outputs.execution_file != ''
+        env:
+          EXEC_FILE: ${{ steps.agent.outputs.execution_file }}
+          LOG_PUBLIC_KEY: ${{ needs.prepare.outputs.log_public_key }}
+        run: |
+          out="$RUNNER_TEMP/factory-log"; mkdir -p "$out"
+          if [ -z "$LOG_PUBLIC_KEY" ] || [ ! -f "$EXEC_FILE" ]; then
+            echo "::warning::no factory/log_public_key.pem (run scripts/bootstrap.sh) or no log — transcript not kept"
+            exit 0
+          fi
+          printf '%s\n' "$LOG_PUBLIC_KEY" > "$RUNNER_TEMP/log_pub.pem"
+          umask 077
+          openssl rand -hex 32 > "$RUNNER_TEMP/log_key.txt"
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in "$EXEC_FILE" -out "$out/execution.json.enc" -pass "file:$RUNNER_TEMP/log_key.txt"
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/log_pub.pem" \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in "$RUNNER_TEMP/log_key.txt" -out "$out/key.enc"
+          rm -f "$RUNNER_TEMP/log_key.txt"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the encrypted log for the record job
+        if: always() && steps.enc.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: factory-exec-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/factory-log
+          retention-days: 1
+          if-no-files-found: ignore
+
+  record:
+    needs: [prepare, agent]
+    # always(): enforcement must run even if the agent failed or hit its turn cap after pushing.
+    if: always() && needs.prepare.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write        # delete a violating agent branch
+      pull-requests: write   # close a violating PR
+      issues: write
+    env:
+      REPO: ${{ github.repository }}
+      ISSUE: ${{ github.event.issue.number }}
+      BRANCH: factory/issue-${{ github.event.issue.number }}
+      BASE: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out factory definition
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.factory_repo }}
+          ref: ${{ inputs.factory_ref }}
+          token: ${{ secrets.FACTORY_TOKEN }}
+          path: .factory
+          persist-credentials: false
+
+      - name: Check out factory data
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.factory_repo }}
+          ref: factory-data
+          token: ${{ secrets.FACTORY_TOKEN }}
+          path: .factory-data
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: factory-exec-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/exec
+
+      - name: Decrypt the execution log
+        if: always()
+        env:
+          LOG_KEY: ${{ secrets.FACTORY_LOG_KEY }}
+        run: |
+          d="$RUNNER_TEMP/exec"
+          if [ -z "$LOG_KEY" ] || [ ! -f "$d/key.enc" ]; then echo "no encrypted log — recording metadata only"; exit 0; fi
+          umask 077
+          printf '%s\n' "$LOG_KEY" > "$RUNNER_TEMP/log_priv.pem"
+          if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/log_priv.pem" \
+               -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+               -in "$d/key.enc" -out "$RUNNER_TEMP/log_key.txt" \
+             && openssl enc -d -aes-256-cbc -pbkdf2 -in "$d/execution.json.enc" -out "$d/execution.json" -pass "file:$RUNNER_TEMP/log_key.txt"; then
+            echo "log decrypted"
+          else
+            echo "::warning::could not decrypt the run log (FACTORY_LOG_KEY does not match factory/log_public_key.pem?)"
+          fi
+          rm -f "$RUNNER_TEMP/log_priv.pem" "$RUNNER_TEMP/log_key.txt" "$d/key.enc" "$d/execution.json.enc"
+
+      - name: Find the agent's branch and PR
+        id: pr
+        run: |
+          url=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""')
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          if gh api "repos/$REPO/branches/$BRANCH" --silent 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            # File list from the API (JSON), written NUL-separated: no shell parsing of agent-chosen names.
+            gh api "repos/$REPO/compare/$BASE...$BRANCH" > "$RUNNER_TEMP/compare.json"
+            python - "$RUNNER_TEMP/compare.json" "$RUNNER_TEMP/files.bin" "$GITHUB_OUTPUT" <<'EOF'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          names = []
+          for f in d.get("files", []):
+              names.append(f["filename"])
+              if f.get("previous_filename"):
+                  names.append(f["previous_filename"])   # a rename out of a protected path still counts
+          open(sys.argv[2], "wb").write(b"\0".join(n.encode() for n in names) + b"\0")
+          adds = sum(f.get("additions", 0) for f in d.get("files", []))
+          dels = sum(f.get("deletions", 0) for f in d.get("files", []))
+          with open(sys.argv[3], "a") as out:
+              out.write(f"stat={len(d.get('files', []))} files, +{adds} -{dels}\n")
+          EOF
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Policy — protected paths and change size
+        id: policy
+        if: steps.pr.outputs.exists == 'true'
+        run: |
+          if python .factory/scripts/factory.py check-paths --files-from "$RUNNER_TEMP/files.bin" > "$RUNNER_TEMP/policy.txt" 2>&1; then
+            echo "verdict=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "verdict=violated" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$RUNNER_TEMP/policy.txt"
+
+      - name: Enforce policy — close PR, delete branch, flag issue
+        if: steps.policy.outputs.verdict == 'violated'
+        env:
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          { echo "🛑 **Closed by the software factory: factory policy violation.**"; echo; echo '```'; cat "$RUNNER_TEMP/policy.txt"; echo '```'; } > "$RUNNER_TEMP/body.md"
+          if [ -n "$PR_URL" ]; then
+            gh pr close "$PR_URL" --comment "$(cat "$RUNNER_TEMP/body.md")"
+          fi
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" || true
+          gh issue comment "$ISSUE" --repo "$REPO" --body-file "$RUNNER_TEMP/body.md"
+          gh issue edit "$ISSUE" --repo "$REPO" --add-label "factory:blocked" || true
+
+      - name: Record session (Layer 2)
+        env:
+          SESSION_ID: ${{ needs.agent.outputs.session_id }}
+          CONCLUSION: ${{ needs.agent.result }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          MODEL: ${{ needs.prepare.outputs.model }}
+          STARTED: ${{ needs.prepare.outputs.started_at }}
+          DIFF_STAT: ${{ steps.pr.outputs.stat }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          exec_file="$RUNNER_TEMP/exec/execution.json"
+          violations=""
+          [ -f "$RUNNER_TEMP/policy.txt" ] && grep -q 'POLICY VIOLATION' "$RUNNER_TEMP/policy.txt" && violations=$(grep '^  - ' "$RUNNER_TEMP/policy.txt" | sed 's/^  - //')
+          python .factory/scripts/factory.py record-session --data-dir .factory-data \
+            --workflow implement --repo "$REPO" --issue "$ISSUE" \
+            --execution-file "$exec_file" --session-id "$SESSION_ID" --conclusion "$CONCLUSION" \
+            --pr-url "$PR_URL" --branch "$BRANCH" --violations "$violations" --model "$MODEL" \
+            --run-id "$RUN_ID" --run-url "$RUN_URL" --started-at "$STARTED" --diff-stat "$DIFF_STAT"
+
+      - name: Push session record
+        env:
+          PUSH_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+        run: |
+          .factory/scripts/push_data.sh .factory-data "session: implement $REPO#$ISSUE run ${{ github.run_id }}"
+
+      - name: Flag outcome
+        env:
+          VERDICT: ${{ steps.policy.outputs.verdict }}
+          AGENT: ${{ needs.agent.result }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          if [ "$VERDICT" = "violated" ]; then echo "::error::Agent work violated factory policy and was closed."; exit 1; fi
+          if [ "$AGENT" != "success" ]; then echo "::error::Implement agent ended with: $AGENT"; exit 1; fi
+          if [ -z "$PR_URL" ]; then echo "::notice::Agent finished without opening a PR (see the issue for why)."; else echo "Agent PR: $PR_URL"; fi

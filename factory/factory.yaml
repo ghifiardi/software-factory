@@ -1,0 +1,109 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FACTORY AS CODE  (Layer 1)
+# Every behaviour of the software factory is declared here. Change the factory
+# by opening a PR against this file — humans and the self-improvement agent
+# both go through the same review. Validated by scripts/factory.py validate.
+# ─────────────────────────────────────────────────────────────────────────────
+version: 1
+org: ghifiardi                    # GitHub account (personal account or org) that owns the factory
+factory_repo: ghifiardi/software-factory   # keep this repo PRIVATE
+data_branch: factory-data         # Layer 2 store. The workflows use this exact name.
+
+# Which product repos may use the factory. Start with one pilot repo.
+repos:
+  allow:
+    - ghifiardi/tantular-cyber
+  # deny wins over allow
+  deny: []
+
+  # How to prepare each repo before the agent starts, and how the agent checks
+  # its work. Runs in the agent job from THIS file (reviewed), never from the issue.
+  settings:
+    ghifiardi/tantular-cyber:
+      python: "3.12"
+      setup: "python -m pip install --upgrade pip && python -m pip install -e '.[dev,semgrep]'"
+      env:
+        SEMGREP_SEND_METRICS: "off"
+        SEMGREP_ENABLE_VERSION_CHECK: "0"
+      # Same gates as the repo's own CI (.github/workflows/ci.yml).
+      checks:
+        - "ruff check ."
+        - "ruff format --check ."
+        - "pytest -q"
+        - "tantular-cyber benchmark --corpus benchmarks/corpus --output out/benchmark-ci"
+      # Extra commands the implement agent may run for this repo.
+      extra_tools: "Bash(ruff:*),Bash(tantular-cyber benchmark:*)"
+
+# Who may trigger agents, by the issue author's relationship to the repo.
+# Labels can only be applied by people with triage+ permission (first gate);
+# this is the second. On PUBLIC repos keep triage restricted too, so strangers
+# can't spend your budget or feed prompt injections to the triage agent.
+trust:
+  allowed_author_associations: [OWNER, MEMBER, COLLABORATOR]   # implement
+  triage_author_associations: [OWNER, MEMBER, COLLABORATOR]    # [] or omit = anyone
+
+# Default inference settings (Layer 4 — a degree of freedom, swap freely).
+defaults:
+  model: claude-sonnet-5-5
+  max_turns: 30
+  timeout_minutes: 45
+
+# Spend guardrails. The implement workflow refuses to start once the month's
+# recorded spend reaches hard_limit_usd.
+budget:
+  monthly_soft_limit_usd: 30      # warning in metrics report (pilot)
+  monthly_hard_limit_usd: 50      # agents stop starting new sessions (pilot — raise once it earns it)
+  per_session_max_turns: 40
+
+# Paths an agent PR may never touch. Enforced after every run; violating PRs
+# are closed automatically.
+policies:
+  protected_paths:
+    - ".github/workflows/**"
+    - "**/.env*"
+    - "**/secrets/**"
+    - "infra/prod/**"
+  require_tests_for_code_changes: true
+  max_files_changed: 25
+
+# The closed loop (Layer 5). Each stage maps to a reusable workflow.
+workflows:
+  triage:
+    trigger: { event: issues.opened }
+    model: claude-haiku-5-5
+    max_turns: 8
+    prompt: prompts/triage.md
+    allowed_tools: "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh label list:*)"
+
+  implement:
+    trigger: { event: issues.labeled, label: "factory:implement" }
+    prompt: prompts/implement.md
+    allowed_tools: "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh pr create:*),Bash(npm test:*),Bash(npm run:*),Bash(pytest:*),Bash(python -m pytest:*),Bash(make test:*)"
+
+  evaluate:
+    trigger: { schedule: "0 1 * * *" }      # daily, UTC
+    model: claude-sonnet-5-5
+    max_turns: 60
+    prompt: prompts/evaluate.md
+    allowed_tools: "Read,Write,Glob,Grep"
+
+  improve:
+    trigger: { schedule: "0 2 * * 1" }      # weekly, Monday UTC
+    model: claude-opus-5-5
+    max_turns: 40
+    prompt: prompts/improve.md
+    # No shell, no git, no GitHub access: the agent only edits files. A separate
+    # job checks the diff against writable_paths, then commits and opens the PR.
+    allowed_tools: "Read,Write,Edit,Glob,Grep"
+    # The improver may only edit these paths — never workflows or policies.
+    writable_paths:
+      - "factory/prompts/**"
+      - "factory/evals/**"
+
+# Labels the factory uses (created by scripts/bootstrap.sh).
+labels:
+  implement: "factory:implement"
+  needs_spec: "factory:needs-spec"
+  ready: "factory:ready"
+  agent_pr: "factory:agent-pr"
+  blocked: "factory:blocked"

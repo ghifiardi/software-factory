@@ -1,0 +1,75 @@
+# MEASUREMENT — central factory repo, weekly. Deterministic script, no agent.
+# Throughput, human interactions per PR, cycle time, cost per merged PR, quality, budget.
+name: factory-metrics
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # Mondays UTC, after improve
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Window in days
+        default: "7"
+
+permissions: {}
+
+concurrency:
+  group: factory-metrics
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # archive the report on factory-data
+      issues: write     # publish the report issue
+    env:
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: factory-data
+          path: data
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+
+      - name: Build report
+        env:
+          # Must be able to read the PRODUCT repos' PRs — the central repo's own token cannot.
+          GITHUB_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+          DAYS: ${{ inputs.days || '7' }}
+        run: |
+          case "$DAYS" in ''|*[!0-9]*) echo "::error::days must be a number"; exit 1;; esac
+          python scripts/factory.py metrics --data-dir data --days "$DAYS" --out factory_report.md
+          cat factory_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Close last week's report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue list --repo "$REPO" --label factory:report --state open --json number --jq '.[].number' \
+            | while read -r n; do gh issue close "$n" --repo "$REPO" --comment "Superseded by this week's report."; done || true
+
+      - name: Publish report issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Factory report — week of $(date -u +%F)"
+          gh issue create --repo "$REPO" --title "$title" --body-file factory_report.md --label factory:report \
+            || gh issue create --repo "$REPO" --title "$title" --body-file factory_report.md
+
+      - name: Archive report
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/reports
+          cp factory_report.md "data/reports/$(date -u +%F).md"
+          scripts/push_data.sh data "report: $(date -u +%F)"

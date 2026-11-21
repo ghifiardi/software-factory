@@ -1,0 +1,157 @@
+# ONLINE EVALS — runs in the CENTRAL factory repo, daily.
+#   agent    scores new implement sessions; read-only token, no shell, writes files only
+#   publish  fresh runner: accepts ONLY well-formed verdicts for the sessions that were
+#            pending, then pushes them to factory-data
+name: factory-evaluate
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # keep in sync with factory.yaml → workflows.evaluate.trigger
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: factory-evaluate
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      count: ${{ steps.pending.outputs.count }}
+      model: ${{ steps.cfg.outputs.model }}
+      session_id: ${{ steps.agent.outputs.session_id }}
+      started_at: ${{ steps.start.outputs.at }}
+    steps:
+      - id: start
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: factory-data
+          path: data
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+
+      - id: pending
+        run: python scripts/factory.py pending-evals --data-dir data --out to_evaluate.txt --limit 40
+
+      - id: cfg
+        if: steps.pending.outputs.count != '0'
+        run: python scripts/factory.py render --workflow evaluate
+
+      - id: agent
+        if: steps.pending.outputs.count != '0'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.cfg.outputs.prompt }}
+          claude_args: ${{ steps.cfg.outputs.claude_args }}
+
+      - name: Collect verdict files (flat copy; nothing else leaves this job)
+        if: always() && steps.pending.outputs.count != '0'
+        env:
+          EXEC_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out/evals"
+          cp to_evaluate.txt "$RUNNER_TEMP/out/"
+          find data/evals -maxdepth 1 -type f -name '*.json' -newer to_evaluate.txt -exec cp {} "$RUNNER_TEMP/out/evals/" \; || true
+          if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then cp "$EXEC_FILE" "$RUNNER_TEMP/out/execution.json"; fi
+          ls -la "$RUNNER_TEMP/out/evals"
+
+      - if: always() && steps.pending.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: factory-evals-${{ github.run_id }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+
+  publish:
+    needs: agent
+    if: always() && needs.agent.outputs.count != '' && needs.agent.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # push to factory-data
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: factory-data
+          path: data
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+      - uses: actions/download-artifact@v4
+        with:
+          name: factory-evals-${{ github.run_id }}
+          path: ${{ runner.temp }}/in
+
+      - name: Accept only valid verdicts for pending sessions
+        run: |
+          python - "$RUNNER_TEMP/in" data <<'EOF'
+          import json, re, sys
+          from pathlib import Path
+          src, data = Path(sys.argv[1]), Path(sys.argv[2])
+          pending = {Path(l.strip()).name for l in (src / "to_evaluate.txt").read_text().splitlines() if l.strip()}
+          known = {fm["id"] for fm in __import__("yaml").safe_load(open("factory/evals/failure_modes.yaml"))["failure_modes"]}
+          ok = bad = 0
+          for f in sorted((src / "evals").glob("*.json")):
+              reason = None
+              if f.name not in pending or not re.fullmatch(r"[A-Za-z0-9_.\-]+\.json", f.name):
+                  reason = "not a pending session"
+              else:
+                  try:
+                      d = json.loads(f.read_text())
+                      q = d.get("quality")
+                      fms = d.get("failure_modes")
+                      if not (isinstance(q, (int, float)) and 1 <= q <= 5 and isinstance(fms, list)):
+                          reason = "bad schema"
+                      elif any(not isinstance(x, dict) or x.get("id") not in known or not isinstance(x.get("detected"), bool) for x in fms):
+                          reason = "unknown failure mode / bad entry"
+                      elif f.stat().st_size > 50_000:
+                          reason = "too large"
+                  except Exception as e:
+                      reason = f"invalid JSON ({e.__class__.__name__})"
+              if reason:
+                  bad += 1; print(f"::warning::rejected {f.name}: {reason}")
+                  continue
+              (data / "evals").mkdir(exist_ok=True)
+              (data / "evals" / f.name).write_text(json.dumps(d, indent=2))
+              ok += 1
+          print(f"accepted {ok}, rejected {bad}")
+          EOF
+
+      - name: Record eval session cost
+        env:
+          SESSION_ID: ${{ needs.agent.outputs.session_id }}
+          CONCLUSION: ${{ needs.agent.result }}
+          MODEL: ${{ needs.agent.outputs.model }}
+          STARTED: ${{ needs.agent.outputs.started_at }}
+          REPO: ${{ github.repository }}
+        run: >
+          python scripts/factory.py record-session --data-dir data --workflow evaluate
+          --repo "$REPO" --execution-file "$RUNNER_TEMP/in/execution.json"
+          --session-id "$SESSION_ID" --conclusion "$CONCLUSION" --model "$MODEL"
+          --run-id "${{ github.run_id }}" --started-at "$STARTED"
+
+      - name: Push
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/push_data.sh data "evals: $(date -u +%F)"

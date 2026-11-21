@@ -1,0 +1,4 @@
+# Every change to the factory, including the self-improvement agent's PRs, is
+# owned by you. On a personal account you can't approve your own PRs, so branch
+# protection on main requires the factory-validate check, not an approval.
+* @ghifiardi

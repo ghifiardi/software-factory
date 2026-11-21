@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local runs of the factory loops (checked out / generated, never committed)
+data/
+factory-src/
+to_evaluate.txt
+eval_digest.md
+factory_report.md
+
+.DS_Store

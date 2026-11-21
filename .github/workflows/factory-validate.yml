@@ -1,0 +1,34 @@
+# CI for the factory repo itself — the check branch protection on main requires.
+# Every change, including the self-improvement agent's PRs, must pass it.
+name: factory-validate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  factory-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml pytest actionlint-py
+      - name: Validate factory definition
+        run: python scripts/factory.py validate
+      - name: Unit tests
+        run: python -m pytest -q tests
+      - name: Lint workflows (catches unknown action inputs, bad expressions)
+        run: actionlint .github/workflows/*.yml templates/factory.yml
+      - name: Shell syntax
+        run: bash -n scripts/*.sh

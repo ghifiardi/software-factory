@@ -1,0 +1,191 @@
+# SELF-IMPROVEMENT LOOP — central factory repo, weekly.
+#   agent    reads the eval digest and edits files only (no shell, no git, read-only token)
+#   publish  fresh runner: applies the agent's diff, refuses anything outside
+#            improve.writable_paths, then commits, pushes and opens the PR with
+#            FACTORY_TOKEN so factory-validate runs and CODEOWNERS review applies.
+name: factory-improve
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"   # Mondays UTC — keep in sync with factory.yaml → workflows.improve.trigger
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: factory-improve
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      model: ${{ steps.cfg.outputs.model }}
+      session_id: ${{ steps.agent.outputs.session_id }}
+      started_at: ${{ steps.start.outputs.at }}
+    steps:
+      - id: start
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: factory-data
+          path: data
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+
+      - run: python scripts/factory.py digest --data-dir data --days 30 --out eval_digest.md
+      - run: cat eval_digest.md >> "$GITHUB_STEP_SUMMARY"
+
+      - id: cfg
+        run: python scripts/factory.py render --workflow improve --var "date=$(date -u +%F)"
+
+      - id: agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.cfg.outputs.prompt }}
+          claude_args: ${{ steps.cfg.outputs.claude_args }}
+
+      - name: Export the agent's proposal as a patch
+        if: always()
+        env:
+          EXEC_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          git add -A -- . ':(exclude)data' ':(exclude)eval_digest.md' ':(exclude)PR_BODY.md'
+          git diff --cached --binary --no-renames > "$RUNNER_TEMP/out/proposal.patch"
+          if [ -f PR_BODY.md ]; then head -c 20000 PR_BODY.md > "$RUNNER_TEMP/out/PR_BODY.md"; fi
+          if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then cp "$EXEC_FILE" "$RUNNER_TEMP/out/execution.json"; fi
+          cp eval_digest.md "$RUNNER_TEMP/out/"
+          wc -c "$RUNNER_TEMP/out/proposal.patch"
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: factory-improve-${{ github.run_id }}
+          path: ${{ runner.temp }}/out
+          retention-days: 3
+
+  publish:
+    needs: agent
+    if: always() && needs.agent.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # session record → factory-data (code branch + PR use FACTORY_TOKEN)
+    env:
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: factory-data
+          path: data
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+      - uses: actions/download-artifact@v4
+        with:
+          name: factory-improve-${{ github.run_id }}
+          path: ${{ runner.temp }}/in
+
+      # Trusted copy of the control script, taken BEFORE the patch touches the tree.
+      - run: |
+          cp scripts/factory.py scripts/push_data.sh "$RUNNER_TEMP/"
+          cp -r factory "$RUNNER_TEMP/factory-pristine"
+
+      - name: Apply proposal and enforce writable_paths
+        id: policy
+        run: |
+          patch="$RUNNER_TEMP/in/proposal.patch"
+          if [ ! -s "$patch" ]; then echo "verdict=nochange" >> "$GITHUB_OUTPUT"; exit 0; fi
+          # git apply refuses paths outside the work tree, inside .git, and writes through symlinks.
+          if ! git apply --index "$patch"; then
+            echo "verdict=violated" >> "$GITHUB_OUTPUT"; echo "::error::proposal patch does not apply cleanly"; exit 0
+          fi
+          git diff --cached --name-only -z --no-renames > "$RUNNER_TEMP/files.bin"
+          if python "$RUNNER_TEMP/factory.py" --config "$RUNNER_TEMP/factory-pristine/factory.yaml" \
+               check-paths --allowlist --files-from "$RUNNER_TEMP/files.bin" > "$RUNNER_TEMP/policy.txt" 2>&1; then
+            echo "verdict=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "verdict=violated" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$RUNNER_TEMP/policy.txt"
+
+      - name: Discard a violating proposal
+        if: steps.policy.outputs.verdict == 'violated'
+        run: |
+          git reset -q --hard
+          echo "::error::Self-improvement proposal touched files outside improve.writable_paths — discarded."
+
+      - name: Commit, push and open the PR
+        if: steps.policy.outputs.verdict == 'ok'
+        env:
+          FACTORY_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+          GH_TOKEN: ${{ secrets.FACTORY_TOKEN }}   # PRs opened with GITHUB_TOKEN would not trigger factory-validate
+        run: |
+          br="factory-improve/$(date -u +%F)-${{ github.run_id }}"
+          git switch -q -c "$br"
+          git -c user.name=factory-bot -c user.email=factory-bot@users.noreply.github.com commit -qm "factory: self-improvement proposal $(date -u +%F)"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$FACTORY_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$(printf 'x-access-token:%s' "$FACTORY_TOKEN" | base64 | tr -d '\n')"
+          git -c http.extraheader="$auth" push -q origin "HEAD:refs/heads/$br"
+          body="$RUNNER_TEMP/in/PR_BODY.md"
+          if [ ! -s "$body" ]; then
+            body="$RUNNER_TEMP/default_body.md"
+            printf 'Weekly self-improvement proposal. The agent did not write a description; see the eval digest in the workflow run.\n' > "$body"
+          fi
+          printf '\n\n---\n_Opened by factory-improve run %s. Changes are limited to improve.writable_paths; human review required._\n' \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$body"
+          gh pr create --repo "$REPO" --base main --head "$br" \
+            --title "factory(self-improvement): $(date -u +%F)" --body-file "$body" \
+            --label factory:self-improvement \
+          || gh pr create --repo "$REPO" --base main --head "$br" \
+            --title "factory(self-improvement): $(date -u +%F)" --body-file "$body"
+
+      - name: No change proposed
+        if: steps.policy.outputs.verdict == 'nochange'
+        run: echo "::notice::The improvement agent proposed no change this week."
+
+      - name: Record session
+        if: always()
+        env:
+          SESSION_ID: ${{ needs.agent.outputs.session_id }}
+          CONCLUSION: ${{ needs.agent.result }}
+          MODEL: ${{ needs.agent.outputs.model }}
+          STARTED: ${{ needs.agent.outputs.started_at }}
+          VERDICT: ${{ steps.policy.outputs.verdict }}
+        run: >
+          python "$RUNNER_TEMP/factory.py" --config "$RUNNER_TEMP/factory-pristine/factory.yaml"
+          record-session --data-dir data --workflow improve --repo "$REPO"
+          --execution-file "$RUNNER_TEMP/in/execution.json" --session-id "$SESSION_ID"
+          --conclusion "$CONCLUSION" --model "$MODEL" --started-at "$STARTED"
+          --violations "$( [ "$VERDICT" = violated ] && echo 'outside improve.writable_paths' )"
+          --run-id "${{ github.run_id }}"
+
+      - name: Push session record
+        if: always()
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          bash "$RUNNER_TEMP/push_data.sh" data "session: improve $(date -u +%F)"
+
+      - name: Fail the run on a violating proposal
+        if: steps.policy.outputs.verdict == 'violated'
+        run: exit 1

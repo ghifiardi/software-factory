@@ -18,7 +18,11 @@ on:
         default: main
     secrets:
       ANTHROPIC_API_KEY:
-        required: true
+        required: false   # inference.provider: anthropic-api
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false   # inference.provider: claude-subscription
+      GATEWAY_KEY:
+        required: false   # inference.provider: gateway
       FACTORY_TOKEN:
         required: true   # pushes the proposal branch and opens the PR in the factory repo
 
@@ -36,6 +40,7 @@ jobs:
       contents: read
     outputs:
       model: ${{ steps.cfg.outputs.model }}
+      provider: ${{ steps.cfg.outputs.provider }}
       session_id: ${{ steps.agent.outputs.session_id }}
       started_at: ${{ steps.start.outputs.at }}
     steps:
@@ -62,10 +67,37 @@ jobs:
       - id: cfg
         run: python scripts/factory.py render --workflow improve --var "date=$(date -u +%F)"
 
+      - name: Check inference credentials
+        env:
+          FACTORY_HAS_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          FACTORY_HAS_CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          FACTORY_HAS_GATEWAY_KEY: ${{ secrets.GATEWAY_KEY != '' }}
+        run: python scripts/factory.py check-inference
+
+      # inference.provider = gateway: a local shim fixes the request shape for the gateway
+      # and adds GATEWAY_KEY, which only this step and the shim process see.
+      - name: Start the gateway shim
+        if: steps.cfg.outputs.provider == 'gateway'
+        env:
+          GATEWAY_URL: ${{ steps.cfg.outputs.gateway_url }}
+          GATEWAY_KEY: ${{ secrets.GATEWAY_KEY }}
+          AGENT_MODEL: ${{ steps.cfg.outputs.model }}
+        run: |
+          cp scripts/gateway_shim.py "$RUNNER_TEMP/gateway_shim.py"   # copy before the agent can touch the tree
+          nohup python3 "$RUNNER_TEMP/gateway_shim.py" 8787 > "$RUNNER_TEMP/gateway_shim.log" 2>&1 &
+          for _ in $(seq 1 20); do curl -s -o /dev/null http://127.0.0.1:8787/ && break; sleep 0.5; done
+          {
+            echo "ANTHROPIC_BASE_URL=http://127.0.0.1:8787"
+            echo "ANTHROPIC_DEFAULT_SONNET_MODEL=$AGENT_MODEL"
+            echo "ANTHROPIC_DEFAULT_HAIKU_MODEL=$AGENT_MODEL"
+            echo "ANTHROPIC_DEFAULT_OPUS_MODEL=$AGENT_MODEL"
+          } >> "$GITHUB_ENV"
+
       - id: agent
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ steps.cfg.outputs.provider == 'anthropic-api' && secrets.ANTHROPIC_API_KEY || steps.cfg.outputs.provider == 'gateway' && 'gateway-shim' || '' }}
+          claude_code_oauth_token: ${{ steps.cfg.outputs.provider == 'claude-subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           github_token: ${{ github.token }}
           prompt: ${{ steps.cfg.outputs.prompt }}
           claude_args: ${{ steps.cfg.outputs.claude_args }}
@@ -186,13 +218,14 @@ jobs:
           SESSION_ID: ${{ needs.agent.outputs.session_id }}
           CONCLUSION: ${{ needs.agent.result }}
           MODEL: ${{ needs.agent.outputs.model }}
+          PROVIDER: ${{ needs.agent.outputs.provider }}
           STARTED: ${{ needs.agent.outputs.started_at }}
           VERDICT: ${{ steps.policy.outputs.verdict }}
         run: >
           python "$RUNNER_TEMP/factory.py" --config "$RUNNER_TEMP/factory-pristine/factory.yaml"
           record-session --data-dir data --workflow improve --repo "$REPO"
           --execution-file "$RUNNER_TEMP/in/execution.json" --session-id "$SESSION_ID"
-          --conclusion "$CONCLUSION" --model "$MODEL" --started-at "$STARTED"
+          --conclusion "$CONCLUSION" --model "$MODEL" --provider "$PROVIDER" --started-at "$STARTED"
           --violations "$( [ "$VERDICT" = violated ] && echo 'outside improve.writable_paths' )"
           --run-id "${{ github.run_id }}"
 

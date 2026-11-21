@@ -119,10 +119,17 @@ done
 
 # The public factory repo needs no secrets: everything that spends or writes runs
 # from the data repo or a product repo.
+provider=$(sed -n 's/^  provider: *\([a-z-]*\).*/\1/p' factory/factory.yaml | head -1)
+case "$provider" in
+  claude-subscription) cred=CLAUDE_CODE_OAUTH_TOKEN ;;   # from `claude setup-token`
+  gateway)             cred=GATEWAY_KEY ;;
+  *)                   cred=ANTHROPIC_API_KEY ;;
+esac
+echo "▸ inference.provider is ${provider:-anthropic-api}: agents need $cred"
 missing=()
 for repo in "$DATA_REPO" "${PRODUCT_REPOS[@]}"; do
   have=$(gh secret list --repo "$repo" --json name --jq '.[].name' 2>/dev/null || true)
-  for s in ANTHROPIC_API_KEY FACTORY_TOKEN; do
+  for s in "$cred" FACTORY_TOKEN; do
     grep -qx "$s" <<< "$have" || missing+=("$repo:$s")
   done
 done

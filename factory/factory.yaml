@@ -43,7 +43,20 @@ trust:
   allowed_author_associations: [OWNER, MEMBER, COLLABORATOR]   # implement
   triage_author_associations: [OWNER, MEMBER, COLLABORATOR]    # [] or omit = anyone
 
-# Default inference settings (Layer 4 — a degree of freedom, swap freely).
+# Which model provider the agents use (Layer 4 — a degree of freedom, swap with a PR).
+#   claude-subscription  your Claude Pro/Max plan. Secret CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`).
+#                        Counts against your plan's usage limits; no per-call bill.
+#   gateway              your own Anthropic-compatible gateway (e.g. Bifrost in front of Ollama).
+#                        Secret GATEWAY_KEY. Requests go through scripts/gateway_shim.py on the runner.
+#   anthropic-api        pay-per-call API key. Secret ANTHROPIC_API_KEY.
+inference:
+  provider: claude-subscription
+  gateway:
+    url: https://openai2.ina17.com/anthropic
+    model: ollama/gpt-oss:120b     # every stage; override per stage with workflows.<stage>.gateway_model
+                                   # (qwen3-coder:30b failed the agent test: it stops after announcing a step)
+
+# Default model settings (used by claude-subscription and anthropic-api).
 defaults:
   model: claude-sonnet-5-5
   max_turns: 30
@@ -52,6 +65,8 @@ defaults:
 # Spend guardrails. The implement workflow refuses to start once the month's
 # recorded spend reaches hard_limit_usd.
 budget:
+  monthly_session_limit: 150      # agent sessions per month, any provider (triage + implement + evaluate + improve)
+  # Dollar limits count only anthropic-api sessions: subscription and gateway runs aren't billed per call.
   monthly_soft_limit_usd: 30      # warning in metrics report (pilot)
   monthly_hard_limit_usd: 50      # agents stop starting new sessions (pilot — raise once it earns it)
   per_session_max_turns: 40

@@ -29,7 +29,7 @@ as code, a closed SDLC loop, and measurement instead of vibes.
 |---|---|
 | 6 · API & MCP first | GitHub Issues/labels are the interface; add Slack/Jira later as extra triggers |
 | 5 · Orchestration | `templates/factory.yml` + reusable workflows in `.github/workflows/` |
-| 4 · Inference & agents | `anthropics/claude-code-action@v1`; model per stage in `factory.yaml` |
+| 4 · Inference & agents | `anthropics/claude-code-action@v1`; provider (Claude subscription · your own gateway · API key) and model per stage in `factory.yaml` |
 | 3 · Compute & sandboxing | Ephemeral GitHub-hosted runners, scoped `--allowedTools`, no unrestricted Bash |
 | 2 · Data & context | `factory-data` branch of the private data repo: `sessions/`, `evals/`, `reports/` |
 | 1 · Factories as code | `factory/factory.yaml`, `factory/prompts/`, `factory/evals/` — changed only by PR |
@@ -44,6 +44,27 @@ as code, a closed SDLC loop, and measurement instead of vibes.
 The factory repo has to be public because a public product repo like `tantular-cyber` can only call
 reusable workflows that live in a public repo. Anything sensitive lives in the data repo.
 
+## Choosing the model provider
+
+Set `inference.provider` in `factory/factory.yaml` (a PR, like any factory change). Each provider needs one
+secret, in the data repo and every product repo:
+
+| `inference.provider` | Secret | Notes |
+|---|---|---|
+| `claude-subscription` (default) | `CLAUDE_CODE_OAUTH_TOKEN` | Your Claude Pro/Max plan. Make the token with `claude setup-token`. Runs count against your plan's usage limits, shared with your own Claude use. |
+| `gateway` | `GATEWAY_KEY` | Your own Anthropic-compatible gateway (`inference.gateway.url`), e.g. Bifrost in front of Ollama. All stages use `inference.gateway.model` unless a stage sets `gateway_model`. |
+| `anthropic-api` | `ANTHROPIC_API_KEY` | Pay per call. Use a dedicated Console workspace with a spend limit. |
+
+**Gateway notes.** Bifrost v2.2.4's `/anthropic` route keeps only the first system block, so the agent
+would lose its instructions. `scripts/gateway_shim.py` runs on the runner, merges the blocks, and adds
+`GATEWAY_KEY` as a Bearer token. Before switching, check a model can drive the agent: in testing,
+`ollama/gpt-oss:120b` fixed a bug and ran the test; `ollama/qwen3-coder:30b` kept stopping after announcing
+a step. The first call after the model is unloaded can take minutes.
+
+**Budget.** `budget.monthly_session_limit` caps agent sessions per month for every provider. The dollar
+limits count only `anthropic-api` sessions: subscription and gateway runs aren't billed per call, and the
+cost Claude Code reports for them is an API-price estimate.
+
 ## Repo layout
 
 ```
@@ -56,6 +77,7 @@ templates/data-repo/           loop schedules bootstrap.sh installs on the data 
 scripts/factory.py             gates, rendering, recording, digest, metrics (PyYAML only)
 scripts/bootstrap.sh           one-time setup (data repo, data branch, loop callers, labels, log key)
 scripts/push_data.sh           commit + push to factory-data with retries; token never written to disk
+scripts/gateway_shim.py        local proxy for inference.provider: gateway (merges system blocks, adds GATEWAY_KEY)
 tests/                         unit tests for the control script
 benchmarks/                    Phase 3: replay history across configs
 ```
@@ -79,14 +101,13 @@ trusted authors because the repo is public.
    `software-factory` + `software-factory-data` + `tantular-cyber`, permissions *Contents: read & write*,
    *Pull requests: read & write*, *Issues: read*, *Metadata: read*.
 4. **Add repo secrets** (personal accounts have no account-wide Actions secrets) in the **data repo
-   and the product repo**. The public factory repo needs none.
+   and the product repo**. The public factory repo needs none. With the default provider
+   (`claude-subscription`), run `claude setup-token` and copy the token it prints, then:
    ```bash
-   gh secret set ANTHROPIC_API_KEY --repo ghifiardi/software-factory-data   # paste the key
-   gh secret set ANTHROPIC_API_KEY --repo ghifiardi/tantular-cyber
-   gh secret set FACTORY_TOKEN     --repo ghifiardi/software-factory-data   # paste the PAT
-   gh secret set FACTORY_TOKEN     --repo ghifiardi/tantular-cyber
+   pbpaste | gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo ghifiardi/software-factory-data
+   pbpaste | gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo ghifiardi/tantular-cyber
    ```
-   Use a key from its own Anthropic Console workspace with a spend limit.
+   and the same for `FACTORY_TOKEN`. For another provider, see *Choosing the model provider*.
 5. **Protect `main`** in the factory repo: require the `factory-validate` status check and require
    PRs. Don't require an approving review: GitHub won't let you approve your own PRs, so that rule
    would block every self-improvement PR. You review them yourself before merging.
@@ -124,7 +145,7 @@ python scripts/factory.py validate && python -m pytest -q tests && actionlint .g
 
 | Stage | Agent job holds | Trusted job (fresh runner) does |
 |---|---|---|
-| triage / implement | `ANTHROPIC_API_KEY` + a repo-scoped token for that product repo | gates, rendering (before); policy check, closing violating PRs, session record (after) — with `FACTORY_TOKEN` |
+| triage / implement | the provider credential + a repo-scoped token for that product repo | gates, rendering (before); policy check, closing violating PRs, session record (after) — with `FACTORY_TOKEN` |
 | evaluate | API key + read-only token; no shell | accepts only well-formed verdicts for sessions that were pending; pushes them |
 | improve | API key + read-only token; no shell, no git | applies the agent's diff, rejects anything outside `improve.writable_paths`, then commits and opens the PR with `FACTORY_TOKEN` |
 
@@ -145,7 +166,8 @@ Other controls:
 Residual risks to accept knowingly:
 - The implement agent runs your test suite, which means it can run code it wrote. Anything in that job's
   environment (the Anthropic key, the repo-scoped app token) is reachable by a determined prompt injection.
-  Use a dedicated Console workspace with a spend limit for `ANTHROPIC_API_KEY`, and keep the trust gate on.
+  Keep the trust gate on. With `claude-subscription` a stolen token spends your plan's limits; with
+  `gateway` it uses your GPU; with `anthropic-api` use a dedicated Console workspace with a spend limit.
 - Run logs from product repos leave the agent job **encrypted** (RSA-OAEP + AES-256) to
   `factory/log_public_key.pem`, because artifacts on public repos are downloadable by anyone; only
   the record job, holding `FACTORY_LOG_KEY`, can read them. Evaluate/improve/metrics run from the

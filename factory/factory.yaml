@@ -15,6 +15,8 @@ repos:
   allow:
     - ghifiardi/tantular-cyber
     - ghifiardi/AI-Deception-Lab
+    - ghifiardi/ai-driven-soc
+    - ghifiardi/gatra_world_monitor
   # deny wins over allow
   deny: []
 
@@ -64,6 +66,43 @@ repos:
         - "cloud/**"
         - "CITATION.cff"
         - "PUBLISHING-AUDIT.md"
+    ghifiardi/ai-driven-soc:
+      python: "3.11"
+      # Mirrors CI's install. requirements.txt is allowed to fail there too (optional extras).
+      setup: "python -m pip install --upgrade pip && (python -m pip install -r requirements.txt || true) && python -m pip install pytest pytest-asyncio pytest-cov pytest-mock"
+      env:
+        ENVIRONMENT: "test"
+        JWT_SECRET: "test-secret-for-ci-only-do-not-use-in-production"
+        MULTITENANT_CONFIG_PATH: "config/gatra_multitenant_config.json"
+      # The repo's CI never fails on tests (`pytest ... || echo`), so these checks are the
+      # real gate for agent PRs.
+      checks:
+        - "pytest tests/ -q"
+      # Deployment material: shell scripts SSH into or deploy to GCP, and cd.yml ships
+      # Dockerfile.gatra to production. Only a human changes these.
+      protected_paths:
+        - "deploy/**"
+        - "deployment_package/**"
+        - "production/**"
+        - "Dockerfile*"
+        - "**/Dockerfile*"
+        - "**/*.sh"
+        - ".env*"
+    ghifiardi/gatra_world_monitor:
+      node: "22"
+      setup: "npm ci"
+      # CI runs only lint:md (lint.yml); the agent also runs the type check and the unit
+      # suites that need no browser or network. Playwright e2e is left to humans.
+      checks:
+        - "npm run typecheck"
+        - "npm run test:data"
+        - "npm run test:sidecar"
+        - "npm run lint:md"
+      # Server config and the desktop app's signing/updater config.
+      protected_paths:
+        - "deploy/**"
+        - "src-tauri/tauri*.conf.json"
+        - "src-tauri/capabilities/**"
 
 # Who may trigger agents, by the issue author's relationship to the repo.
 # Labels can only be applied by people with triage+ permission (first gate);

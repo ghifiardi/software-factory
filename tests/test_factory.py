@@ -639,3 +639,24 @@ def test_validate_rejects_duplicate_keys(tmp_path):
     assert dup != text
     p = tmp_path / "f.yaml"; p.write_text(dup)
     assert factory.main(["--config", str(p), "validate"]) == 1
+
+
+def test_summarise_execution_handles_permission_denied_system_messages():
+    # Claude Code logs auto-mode denials as system messages whose "message" is a string.
+    msgs = [
+        {"type": "system", "subtype": "init"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "git push"}}]}},
+        {"type": "system", "subtype": "permission_denied",
+         "message": "Permission for this action was denied by the Claude Code auto mode classifier."},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "is_error": True, "content": "denied"}]}},
+        "stray string line",
+        {"type": "result", "num_turns": 3, "is_error": False, "permission_denials_count": 1,
+         "result": "blocked"},
+    ]
+    metrics, transcript = factory.summarise_execution(msgs)
+    assert metrics["permission_denials"] == 1
+    assert metrics["tool_calls"] == 1 and metrics["tool_errors"] == 1
+    assert {"role": "permission_denied",
+            "text": "Permission for this action was denied by the Claude Code auto mode classifier."} in transcript

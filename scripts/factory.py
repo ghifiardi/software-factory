@@ -451,23 +451,36 @@ def load_execution(path: Path) -> list[dict]:
 
 def summarise_execution(msgs: list[dict], max_chars: int = 600) -> tuple[dict, list[dict]]:
     metrics = {"cost_usd": None, "num_turns": None, "duration_ms": None, "tool_calls": 0,
-               "tool_errors": 0, "is_error": None, "tools_used": {}}
+               "tool_errors": 0, "is_error": None, "tools_used": {}, "permission_denials": 0}
     tools = Counter()
     transcript = []
     for m in msgs:
+        if not isinstance(m, dict):
+            continue
         t = m.get("type")
         if t == "result":
             metrics["cost_usd"] = m.get("total_cost_usd", m.get("cost_usd"))
             metrics["num_turns"] = m.get("num_turns")
             metrics["duration_ms"] = m.get("duration_ms")
             metrics["is_error"] = m.get("is_error")
+            metrics["permission_denials"] = m.get("permission_denials_count",
+                                                  len(m.get("permission_denials") or []))
             if m.get("result"):
                 transcript.append({"role": "result", "text": redact(str(m["result"]))[:max_chars * 2]})
             continue
-        content = (m.get("message") or {}).get("content")
+        message = m.get("message")
+        if not isinstance(message, dict):
+            # e.g. {"type": "system", "subtype": "permission_denied", "message": "<reason>"}
+            if isinstance(message, str) and message:
+                transcript.append({"role": m.get("subtype") or t or "system",
+                                   "text": redact(message)[:max_chars]})
+            continue
+        content = message.get("content")
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
         for block in content or []:
+            if not isinstance(block, dict):
+                continue
             bt = block.get("type")
             if bt == "text" and t == "assistant":
                 transcript.append({"role": "assistant", "text": redact(block["text"])[:max_chars]})
